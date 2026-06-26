@@ -1,12 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { loadModels } from "@/lib/inference";
-import { Detection } from "@/lib/yoloDecode";
-import DetectionPanel from "@/components/DetectionPanel";
+import { loadModels, activeBackend } from "@/lib/inference";
+import type { Detection } from "@/lib/yoloDecode";
+import type { EvidenceEvent } from "@/lib/evidence";
+import EventsPanel from "@/components/EventsPanel";
+import LiveDetections, { type LiveDetectionsHandle } from "@/components/LiveDetections";
 import ModelStatusBadge from "@/components/ModelStatusBadge";
+
+const MAX_EVENTS = 50;
 
 // WebcamCanvas uses browser APIs — disable SSR entirely
 const WebcamCanvas = dynamic(() => import("@/components/WebcamCanvas"), {
@@ -15,48 +19,29 @@ const WebcamCanvas = dynamic(() => import("@/components/WebcamCanvas"), {
 
 export default function DemoPage() {
   const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
-  const [detections, setDetections] = useState<Detection[]>([]);
+  const [events, setEvents] = useState<EvidenceEvent[]>([]);
+  const liveRef = useRef<LiveDetectionsHandle>(null);
+
+  function handleEvent(event: EvidenceEvent) {
+    setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
+  }
+
+  // Stable callback — pushes detections straight to the DOM via the ref handle,
+  // so per-frame updates never re-render this page.
+  const handleDetections = useCallback((dets: Detection[]) => {
+    liveRef.current?.update(dets);
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    let modelLoadTimer: number | null = null;
-    let modelLoadIdleCallback: number | null = null;
-    const idleWindow = window as Window & {
-      requestIdleCallback?: (
-        callback: IdleRequestCallback,
-        options?: IdleRequestOptions,
-      ) => number;
-      cancelIdleCallback?: (handle: number) => void;
-    };
-
-    const startModelLoad = () => {
-      if (cancelled) return;
-      loadModels()
-        .then(() => {
-          if (!cancelled) setModelState("ready");
-        })
-        .catch((err) => {
-          if (cancelled) return;
-          console.error("Model load failed:", err);
-          setModelState("error");
-        });
-    };
-
-    if (idleWindow.requestIdleCallback) {
-      modelLoadIdleCallback = idleWindow.requestIdleCallback(startModelLoad, { timeout: 3000 });
-    } else {
-      modelLoadTimer = window.setTimeout(startModelLoad, 1000);
-    }
-
-    return () => {
-      cancelled = true;
-      if (modelLoadIdleCallback !== null && idleWindow.cancelIdleCallback) {
-        idleWindow.cancelIdleCallback(modelLoadIdleCallback);
-      }
-      if (modelLoadTimer !== null) {
-        window.clearTimeout(modelLoadTimer);
-      }
-    };
+    loadModels()
+      .then(() => {
+        console.info("[inference] backend:", activeBackend);
+        setModelState("ready");
+      })
+      .catch((err) => {
+        console.error("Model load failed:", err);
+        setModelState("error");
+      });
   }, []);
 
   return (
@@ -90,7 +75,7 @@ export default function DemoPage() {
               margin: 0,
             }}
           >
-            Aegis
+            GuardAI
           </h1>
           <span style={{ color: "var(--border)" }}>|</span>
           <ModelStatusBadge state={modelState} />
@@ -130,57 +115,65 @@ export default function DemoPage() {
             minHeight: 400,
           }}
         >
-          {/* Render webcam once models are ready */}
-          {modelState === "ready" ? (
-            <WebcamCanvas onDetections={setDetections} />
-          ) : (
+          {modelState === "loading" && (
             <div
               style={{
-                minHeight: 400,
-                height: "100%",
+                position: "absolute",
+                inset: 0,
                 display: "flex",
                 flexDirection: "column",
                 alignItems: "center",
                 justifyContent: "center",
                 gap: 12,
-                padding: 24,
                 color: "var(--muted)",
-                textAlign: "center",
+                fontSize: 14,
+                background: "var(--card)",
+                zIndex: 10,
               }}
             >
-              <div
-                style={{
-                  color: "var(--text)",
-                  fontSize: 15,
-                  fontWeight: 700,
-                }}
-              >
-                Detection preview loading
-              </div>
-              <div style={{ maxWidth: 360, fontSize: 13, lineHeight: 1.5 }}>
-                The camera monitor is available while detection models initialize.
-              </div>
-              <Link
-                href="/cameras"
-                style={{
-                  borderRadius: 6,
-                  border: "1px solid var(--border)",
-                  background: "var(--accent)",
-                  color: "#000",
-                  fontSize: 13,
-                  fontWeight: 700,
-                  padding: "8px 12px",
-                  textDecoration: "none",
-                }}
-              >
-                View all cameras
-              </Link>
+              <LoadingSpinner />
+              <span>Loading models&hellip;</span>
+              <span style={{ fontSize: 11, color: "#555" }}>
+                First load may take 10–20s
+              </span>
             </div>
+          )}
+
+          {modelState === "error" && (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                color: "var(--red)",
+                fontSize: 14,
+                background: "var(--card)",
+                zIndex: 10,
+              }}
+            >
+              <span style={{ fontSize: 24 }}>&#9888;</span>
+              <span>Failed to load models</span>
+              <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                Check console for details
+              </span>
+            </div>
+          )}
+
+          {/* Render webcam once models are ready */}
+          {modelState === "ready" && (
+            <WebcamCanvas onDetections={handleDetections} onEvent={handleEvent} />
           )}
         </div>
 
-        {/* Detection panel */}
-        <DetectionPanel detections={detections} modelState={modelState} />
+        {/* Right column: live detections (imperative) + saved events feed */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, minHeight: 0 }}>
+          <LiveDetections ref={liveRef} />
+          <EventsPanel events={events} live={modelState === "ready"} />
+        </div>
       </main>
 
       <style>{`
@@ -191,6 +184,23 @@ export default function DemoPage() {
           }
         }
       `}</style>
+    </div>
+  );
+}
+
+function LoadingSpinner() {
+  return (
+    <div
+      style={{
+        width: 28,
+        height: 28,
+        border: "3px solid var(--border)",
+        borderTop: "3px solid var(--accent)",
+        borderRadius: "50%",
+        animation: "spin 0.8s linear infinite",
+      }}
+    >
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
