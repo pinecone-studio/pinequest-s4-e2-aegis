@@ -3,13 +3,92 @@
 import { useEffect, useRef } from "react";
 import { runInference } from "@/lib/inference";
 import { Detection } from "@/lib/yoloDecode";
-import { ALERT_THRESHOLD } from "@/lib/modelConfig";
+import { ALERT_THRESHOLD, SMOKING_THRESHOLD } from "@/lib/modelConfig";
+import type { EvidenceEvent } from "@/lib/evidence";
 
 const SMOKING_COLOR = "#ef4444";
 const LITTER_COLOR = "#f97316";
 
+// Minimum gap between saved evidence snapshots, to avoid spamming the
+// evidence/ folder while the model fires every frame (~10 fps).
+const CAPTURE_COOLDOWN_MS = 8000;
+const THUMB_WIDTH = 200;
+
 interface Props {
-  onDetections: (dets: Detection[]) => void;
+  onDetections?: (dets: Detection[]) => void;
+  onEvent?: (event: EvidenceEvent) => void;
+}
+
+/**
+ * Grab the raw video frame, POST it to /api/evidence for local saving, and
+ * emit an EvidenceEvent (with a thumbnail preview) for the sidebar feed.
+ */
+async function captureEvidence(
+  video: HTMLVideoElement,
+  confidence: number,
+  onEvent?: (event: EvidenceEvent) => void,
+): Promise<void> {
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+  if (!w || !h) return;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.drawImage(video, 0, 0, w, h);
+
+  // Small preview for the sidebar (evidence/ isn't served statically).
+  const thumbCanvas = document.createElement("canvas");
+  thumbCanvas.width = THUMB_WIDTH;
+  thumbCanvas.height = Math.round((h / w) * THUMB_WIDTH);
+  thumbCanvas
+    .getContext("2d")
+    ?.drawImage(video, 0, 0, thumbCanvas.width, thumbCanvas.height);
+  const thumb = thumbCanvas.toDataURL("image/jpeg", 0.6);
+
+  const time = Date.now();
+  let savedPath: string | null = null;
+  let saveError: string | undefined;
+
+  const blob: Blob | null = await new Promise((resolve) =>
+    canvas.toBlob(resolve, "image/jpeg", 0.9),
+  );
+
+  if (blob) {
+    const form = new FormData();
+    form.append("file", blob, "snapshot.jpg");
+    form.append("cameraId", "webcam");
+    form.append("type", "smoking");
+    form.append("confidence", String(confidence));
+    try {
+      const res = await fetch("/api/evidence", { method: "POST", body: form });
+      const data = await res.json();
+      if (res.ok) {
+        savedPath = data.saved as string;
+        console.log("[evidence] saved", savedPath);
+      } else {
+        saveError = data.error ?? `HTTP ${res.status}`;
+        console.error("[evidence] save failed:", saveError);
+      }
+    } catch (err) {
+      saveError = err instanceof Error ? err.message : "network error";
+      console.error("[evidence] save error:", err);
+    }
+  } else {
+    saveError = "could not encode frame";
+  }
+
+  onEvent?.({
+    id: `${time}`,
+    label: "Smoking",
+    confidence,
+    time,
+    thumb,
+    savedPath,
+    saveError,
+  });
 }
 
 function getColor(label: string): string {
@@ -26,7 +105,6 @@ function drawBoxes(
   overlay.height = displayH;
   const ctx = overlay.getContext("2d")!;
   ctx.clearRect(0, 0, displayW, displayH);
-  console.log("[render]", dets.length);
 
   for (const det of dets) {
     const [x1, y1, x2, y2] = det.box;
@@ -56,20 +134,26 @@ function drawBoxes(
   }
 }
 
-export default function WebcamCanvas({ onDetections }: Props) {
+export default function WebcamCanvas({ onDetections, onEvent }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const onDetectionsRef = useRef(onDetections);
+  const onEventRef = useRef(onEvent);
+  const lastCaptureRef = useRef(0);
 
   useEffect(() => {
     onDetectionsRef.current = onDetections;
   }, [onDetections]);
 
   useEffect(() => {
+    onEventRef.current = onEvent;
+  }, [onEvent]);
+
+  useEffect(() => {
     let running = true;
     let stream: MediaStream | null = null;
-    let inferenceTimer: ReturnType<typeof setInterval> | null = null;
+    let frameTimer: ReturnType<typeof setTimeout> | null = null;
 
     async function start() {
       try {
@@ -87,33 +171,48 @@ export default function WebcamCanvas({ onDetections }: Props) {
       video.srcObject = stream;
       await video.play();
 
-      inferenceTimer = setInterval(async () => {
+      // Self-scheduling loop: run the next inference only after the previous
+      // one finishes. Avoids the backlog/flicker of a fixed-interval timer
+      // when a frame takes longer than the interval.
+      const loop = async () => {
+        if (!running) return;
         const vid = videoRef.current;
         const overlay = overlayRef.current;
         const container = containerRef.current;
 
-        if (!running || !vid || !overlay || !container || vid.readyState < 2) return;
+        if (vid && overlay && container && vid.readyState >= 2) {
+          try {
+            const dets = await runInference(vid);
 
-        let dets: Detection[] = [];
-        try {
-          dets = await runInference(vid);
-        } catch (err) {
-          console.error("runInference error:", err);
-          return;
+            onDetectionsRef.current?.(dets);
+
+            // Capture evidence when a smoking detection clears 50% (throttled).
+            const smoking = dets
+              .filter((d) => d.label === "Smoking" && d.confidence >= SMOKING_THRESHOLD)
+              .sort((a, b) => b.confidence - a.confidence)[0];
+            if (smoking && Date.now() - lastCaptureRef.current >= CAPTURE_COOLDOWN_MS) {
+              lastCaptureRef.current = Date.now();
+              void captureEvidence(vid, smoking.confidence, onEventRef.current);
+            }
+
+            const { offsetWidth: w, offsetHeight: h } = container;
+            drawBoxes(overlay, dets, w, h);
+          } catch (err) {
+            console.error("runInference error:", err);
+          }
         }
 
-        onDetectionsRef.current(dets);
+        if (running) frameTimer = setTimeout(loop, 0);
+      };
 
-        const { offsetWidth: w, offsetHeight: h } = container;
-        drawBoxes(overlay, dets, w, h);
-      }, 100); // ~10 fps
+      loop();
     }
 
     start().catch(console.error);
 
     return () => {
       running = false;
-      if (inferenceTimer !== null) clearInterval(inferenceTimer);
+      if (frameTimer !== null) clearTimeout(frameTimer);
       stream?.getTracks().forEach((t) => t.stop());
     };
   }, []);

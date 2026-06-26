@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import CameraStatusBadge from "./CameraStatusBadge";
 import { buildCameraStreamUrl } from "../lib/cameraApi";
 import type { CameraView } from "../lib/cameraTypes";
 import type { StreamLoadState } from "./CameraGrid";
@@ -12,38 +11,38 @@ function cameraTitle(camera: CameraView) {
   return camera.name || camera.id;
 }
 
-function cameraMeta(camera: CameraView) {
-  const parts = [];
-  if (camera.host) parts.push(camera.host);
-  if (camera.location) parts.push(camera.location);
-  if (camera.description && camera.description.toLowerCase() !== "unknown") {
-    parts.push(camera.description);
-  }
-  if (parts.length === 0 && camera.floor) parts.push(`Floor ${camera.floor}`);
-  if (parts.length === 0 && camera.zone && camera.zone !== "unknown") parts.push(camera.zone);
-  return parts.join(" • ");
-}
-
 export default function CameraCard({
   camera,
+  label,
   streamState,
+  selected,
+  onSelect,
   onStreamSettled,
 }: {
   camera: CameraView;
+  label: string;
   streamState: StreamLoadState;
+  selected?: boolean;
+  onSelect?: () => void;
   onStreamSettled: (state: "online" | "stream_unavailable") => void;
 }) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const streamUrl = buildCameraStreamUrl(camera);
-  const streamActive = camera.enabled !== false && (streamState === "loading" || streamState === "online");
+  const streamActive =
+    camera.enabled !== false && (streamState === "loading" || streamState === "online");
   const showStream = streamActive;
-  const displayStatus = camera.enabled === false
-    ? "disabled"
-    : streamState === "stream_unavailable"
-      ? "stream_unavailable"
-      : streamState === "online"
-        ? "online"
-        : "loading";
+
+  const isDisabled = camera.enabled === false;
+  const isUnavailable = streamState === "stream_unavailable";
+  const isOnline = streamState === "online";
+
+  const dotColor = isDisabled
+    ? "var(--faint)"
+    : isUnavailable
+      ? "var(--red)"
+      : isOnline
+        ? "var(--brand)"
+        : "var(--yellow)";
 
   useEffect(() => {
     setImageLoaded(false);
@@ -68,126 +67,117 @@ export default function CameraCard({
 
   return (
     <article
-      className="rounded-xl border border-neutral-800 bg-neutral-900/70 overflow-hidden"
+      className="cam-tile"
+      onClick={onSelect}
       style={{
-        minWidth: 0,
+        position: "relative",
+        aspectRatio: "16 / 9",
+        width: "100%",
         overflow: "hidden",
-        borderRadius: 12,
-        border: "1px solid #262626",
-        background: "rgba(23, 23, 23, 0.7)",
+        borderRadius: 10,
+        background: "#000",
+        cursor: onSelect ? "pointer" : "default",
+        border: selected ? "2px solid var(--brand)" : "1px solid var(--border)",
+        boxShadow: selected ? "0 0 0 3px var(--brand-soft)" : "none",
       }}
     >
-      <div
-        className="relative aspect-video w-full overflow-hidden bg-black"
-        style={{
-          position: "relative",
-          aspectRatio: "16 / 9",
-          width: "100%",
-          overflow: "hidden",
-          background: "#000",
-        }}
-      >
-        {showStream ? (
-          <>
-            <img
-              src={camera.stream_url ?? streamUrl}
-              alt={cameraTitle(camera)}
-              className="h-full w-full object-cover"
-              style={{
-                display: "block",
-                height: "100%",
-                width: "100%",
-                objectFit: "cover",
-              }}
-              onLoad={() => {
-                setImageLoaded(true);
-                onStreamSettled("online");
-              }}
-              onError={() => {
-                setImageLoaded(false);
-                onStreamSettled("stream_unavailable");
-              }}
-            />
-            {streamState === "loading" && !imageLoaded ? (
-              <div
-                className="absolute inset-0 flex items-center justify-center text-xs text-[var(--muted)]"
-                style={{
-                  position: "absolute",
-                  inset: 0,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--muted)",
-                  fontSize: 12,
-                  background: "#000",
-                }}
-              >
-                LOADING
-              </div>
-            ) : null}
-          </>
-        ) : (
-          <div
-            className="flex h-full w-full items-center justify-center text-xs text-[var(--muted)]"
+      {showStream ? (
+        <>
+          <img
+            src={camera.stream_url ?? streamUrl}
+            alt={cameraTitle(camera)}
             style={{
-              display: "flex",
+              display: "block",
               height: "100%",
               width: "100%",
-              alignItems: "center",
-              justifyContent: "center",
-              color: "var(--muted)",
-              fontSize: 12,
+              objectFit: "cover",
             }}
-          >
-            {camera.enabled === false
-              ? "Disabled"
-              : streamState === "stream_unavailable"
-                ? "STREAM UNAVAILABLE"
-                : "LOADING"}
-          </div>
-        )}
-      </div>
+            onLoad={() => {
+              setImageLoaded(true);
+              onStreamSettled("online");
+            }}
+            onError={() => {
+              setImageLoaded(false);
+              onStreamSettled("stream_unavailable");
+            }}
+          />
+          {streamState === "loading" && !imageLoaded ? (
+            <div className="cam-overlay-center">LOADING</div>
+          ) : null}
+        </>
+      ) : (
+        <div className="cam-overlay-center">
+          {isDisabled ? "DISABLED" : isUnavailable ? "STREAM UNAVAILABLE" : "LOADING"}
+        </div>
+      )}
 
+      {/* gradient + label overlay */}
       <div
-        className="flex min-w-0 items-start justify-between gap-3 px-1 pb-1 pt-2"
         style={{
+          position: "absolute",
+          inset: 0,
+          pointerEvents: "none",
+          background:
+            "linear-gradient(to top, rgba(0,0,0,0.55) 0%, rgba(0,0,0,0) 34%)",
+        }}
+      />
+      <div
+        style={{
+          position: "absolute",
+          left: 12,
+          bottom: 10,
           display: "flex",
-          minWidth: 0,
-          alignItems: "flex-start",
-          justifyContent: "space-between",
-          gap: 12,
-          padding: "10px 12px 12px",
+          alignItems: "center",
+          gap: 7,
         }}
       >
-        <div className="min-w-0 space-y-1" style={{ minWidth: 0 }}>
-          <div
-            className="truncate text-sm font-semibold text-[var(--text)]"
-            style={{
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              color: "var(--text)",
-              fontSize: 14,
-              fontWeight: 600,
-            }}
-          >
-            {cameraTitle(camera)}
-          </div>
-          <div
-            className="truncate text-xs text-[var(--muted)]"
-            style={{
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              color: "var(--muted)",
-              fontSize: 12,
-            }}
-          >
-            {cameraMeta(camera) || camera.id}
-          </div>
-        </div>
-        <CameraStatusBadge camera={camera} displayStatus={displayStatus} />
+        <span
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: "50%",
+            background: dotColor,
+            boxShadow: isOnline ? `0 0 6px ${dotColor}` : "none",
+            flexShrink: 0,
+          }}
+        />
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#fff",
+            letterSpacing: "0.02em",
+            textShadow: "0 1px 2px rgba(0,0,0,0.6)",
+          }}
+        >
+          {label}
+        </span>
       </div>
+
+      <button
+        type="button"
+        title="Camera settings"
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          position: "absolute",
+          right: 10,
+          bottom: 8,
+          width: 24,
+          height: 24,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          border: "none",
+          background: "transparent",
+          color: "rgba(255,255,255,0.75)",
+          cursor: "pointer",
+        }}
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+        </svg>
+      </button>
     </article>
   );
 }

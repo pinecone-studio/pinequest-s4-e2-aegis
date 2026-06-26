@@ -8,7 +8,21 @@ const MAX_ACTIVE_STREAM_LOADS = 10;
 
 export type StreamLoadState = "not_started" | "loading" | "online" | "stream_unavailable";
 
-export default function CameraGrid({ cameras }: { cameras: CameraView[] }) {
+function cameraLabel(camera: CameraView, index: number): string {
+  return camera.name || `CCTV ${String(index + 1).padStart(2, "0")}`;
+}
+
+export default function CameraGrid({
+  cameras,
+  columns = 2,
+  selectedId,
+  onSelect,
+}: {
+  cameras: CameraView[];
+  columns?: number;
+  selectedId?: string | null;
+  onSelect?: (id: string) => void;
+}) {
   const loadableCameraIds = useMemo(
     () => cameras.filter((camera) => camera.enabled !== false).map((camera) => camera.id),
     [cameras],
@@ -49,46 +63,38 @@ export default function CameraGrid({ cameras }: { cameras: CameraView[] }) {
   if (cameras.length === 0) {
     return (
       <div
-        className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
         style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-          gap: 16,
+          display: "flex",
+          aspectRatio: "16 / 9",
+          alignItems: "center",
+          justifyContent: "center",
+          borderRadius: 10,
+          border: "1px solid var(--border)",
+          background: "var(--card)",
+          color: "var(--muted)",
+          fontSize: 13,
         }}
       >
-        <div
-          className="flex aspect-video items-center justify-center rounded-lg border border-[var(--border)] bg-[#111] text-xs text-[var(--muted)]"
-          style={{
-            aspectRatio: "16 / 9",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            borderRadius: 8,
-            border: "1px solid var(--border)",
-            background: "#111",
-            color: "var(--muted)",
-            fontSize: 12,
-          }}
-        >
-          No cameras configured
-        </div>
+        No cameras configured
       </div>
     );
   }
 
   return (
     <div
-      className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"
       style={{
         display: "grid",
-        gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
-        gap: 16,
+        gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+        gap: 14,
       }}
     >
-      {cameras.map((camera) => (
+      {cameras.map((camera, index) => (
         <CameraCard
           key={camera.id}
           camera={camera}
+          label={cameraLabel(camera, index)}
+          selected={selectedId === camera.id}
+          onSelect={onSelect ? () => onSelect(camera.id) : undefined}
           streamState={streamStates[camera.id] ?? "not_started"}
           onStreamSettled={(state) => {
             setStreamStates((current) => {

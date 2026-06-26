@@ -1,12 +1,16 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
-import { loadModels } from "@/lib/inference";
-import { Detection } from "@/lib/yoloDecode";
-import DetectionPanel from "@/components/DetectionPanel";
+import { loadModels, activeBackend } from "@/lib/inference";
+import type { Detection } from "@/lib/yoloDecode";
+import type { EvidenceEvent } from "@/lib/evidence";
+import EventsPanel from "@/components/EventsPanel";
+import LiveDetections, { type LiveDetectionsHandle } from "@/components/LiveDetections";
 import ModelStatusBadge from "@/components/ModelStatusBadge";
+
+const MAX_EVENTS = 50;
 
 // WebcamCanvas uses browser APIs — disable SSR entirely
 const WebcamCanvas = dynamic(() => import("@/components/WebcamCanvas"), {
@@ -15,11 +19,25 @@ const WebcamCanvas = dynamic(() => import("@/components/WebcamCanvas"), {
 
 export default function DemoPage() {
   const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
-  const [detections, setDetections] = useState<Detection[]>([]);
+  const [events, setEvents] = useState<EvidenceEvent[]>([]);
+  const liveRef = useRef<LiveDetectionsHandle>(null);
+
+  function handleEvent(event: EvidenceEvent) {
+    setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
+  }
+
+  // Stable callback — pushes detections straight to the DOM via the ref handle,
+  // so per-frame updates never re-render this page.
+  const handleDetections = useCallback((dets: Detection[]) => {
+    liveRef.current?.update(dets);
+  }, []);
 
   useEffect(() => {
     loadModels()
-      .then(() => setModelState("ready"))
+      .then(() => {
+        console.info("[inference] backend:", activeBackend);
+        setModelState("ready");
+      })
       .catch((err) => {
         console.error("Model load failed:", err);
         setModelState("error");
@@ -147,12 +165,15 @@ export default function DemoPage() {
 
           {/* Render webcam once models are ready */}
           {modelState === "ready" && (
-            <WebcamCanvas onDetections={setDetections} />
+            <WebcamCanvas onDetections={handleDetections} onEvent={handleEvent} />
           )}
         </div>
 
-        {/* Detection panel */}
-        <DetectionPanel detections={detections} />
+        {/* Right column: live detections (imperative) + saved events feed */}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16, minHeight: 0 }}>
+          <LiveDetections ref={liveRef} />
+          <EventsPanel events={events} live={modelState === "ready"} />
+        </div>
       </main>
 
       <style>{`
