@@ -23,31 +23,58 @@ let litterSession: OrtType.InferenceSession | null = null;
 let cocoSession: OrtType.InferenceSession | null = null;
 let isRunning = false;
 
+export let activeBackend: "webgpu" | "wasm" = "wasm";
+
 export async function loadModels(): Promise<void> {
   ort = await import("onnxruntime-web");
 
   ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/";
   ort.env.wasm.numThreads = 1;
 
-  [smokingSession, litterSession, cocoSession] = await Promise.all([
-    ort.InferenceSession.create(SMOKING_MODEL_PATH, {
-      executionProviders: ["wasm"],
-    }),
-    ort.InferenceSession.create(LITTER_MODEL_PATH, {
-      executionProviders: ["wasm"],
-    }),
-    ort.InferenceSession.create(COCO_MODEL_PATH, {
-      executionProviders: ["wasm"],
-    }),
-  ]);
+  // WebGPU (Chrome/Edge) is several times faster than the single-thread WASM
+  // backend. Try it first, fall back to WASM if the device lacks it.
+  const hasWebGPU =
+    typeof navigator !== "undefined" &&
+    (navigator as Navigator & { gpu?: unknown }).gpu != null;
+  const providers: ("webgpu" | "wasm")[] = hasWebGPU ? ["webgpu", "wasm"] : ["wasm"];
+
+  const create = (path: string) =>
+    ort!.InferenceSession.create(path, { executionProviders: providers });
+
+  try {
+    [smokingSession, litterSession, cocoSession] = await Promise.all([
+      create(SMOKING_MODEL_PATH),
+      create(LITTER_MODEL_PATH),
+      create(COCO_MODEL_PATH),
+    ]);
+    activeBackend = hasWebGPU ? "webgpu" : "wasm";
+  } catch (err) {
+    // WebGPU init can fail on some GPUs/drivers — retry on WASM only.
+    console.warn("[inference] WebGPU init failed, falling back to WASM:", err);
+    const createWasm = (path: string) =>
+      ort!.InferenceSession.create(path, { executionProviders: ["wasm"] });
+    [smokingSession, litterSession, cocoSession] = await Promise.all([
+      createWasm(SMOKING_MODEL_PATH),
+      createWasm(LITTER_MODEL_PATH),
+      createWasm(COCO_MODEL_PATH),
+    ]);
+    activeBackend = "wasm";
+  }
 }
+
+// Reused across frames to avoid allocating a canvas every inference.
+let preprocessCanvas: HTMLCanvasElement | null = null;
+let preprocessCtx: CanvasRenderingContext2D | null = null;
 
 function preprocessFrame(source: HTMLVideoElement | HTMLCanvasElement): Float32Array {
   if (!ort) throw new Error("ORT not loaded");
-  const offscreen = document.createElement("canvas");
-  offscreen.width = INPUT_SIZE;
-  offscreen.height = INPUT_SIZE;
-  const ctx = offscreen.getContext("2d")!;
+  if (!preprocessCanvas) {
+    preprocessCanvas = document.createElement("canvas");
+    preprocessCanvas.width = INPUT_SIZE;
+    preprocessCanvas.height = INPUT_SIZE;
+    preprocessCtx = preprocessCanvas.getContext("2d", { willReadFrequently: true });
+  }
+  const ctx = preprocessCtx!;
   ctx.drawImage(source as CanvasImageSource, 0, 0, INPUT_SIZE, INPUT_SIZE);
   const { data } = ctx.getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
 

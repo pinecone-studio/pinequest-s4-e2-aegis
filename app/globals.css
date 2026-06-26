@@ -1,22 +1,35 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #0f0f0f;
+  --bg: #0a0a0a;
+  --panel: #141414;
   --card: #1a1a1a;
-  --border: #2a2a2a;
-  --text: #e0e0e0;
-  --muted: #888;
+  --elevated: #1f1f1f;
+  --border: #272727;
+  --border-soft: #1e1e1e;
+  --text: #e8e8e8;
+  --muted: #8a8a8a;
+  --faint: #5c5c5c;
   --accent: #3b82f6;
+  --brand: #f0652c;
+  --brand-soft: rgba(240, 101, 44, 0.14);
   --red: #ef4444;
   --orange: #f97316;
   --green: #22c55e;
   --yellow: #eab308;
 }
 
+html, body { height: 100%; }
+
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: 'Segoe UI', system-ui, sans-serif;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   font-size: 14px;
   min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
 }
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #2c2c2c; border-radius: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
