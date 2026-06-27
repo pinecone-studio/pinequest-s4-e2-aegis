@@ -1,8 +1,8 @@
 """
-Fine-tune YOLOv8 on the trash/litter dataset and save weights to models/trash.pt.
+Fine-tune YOLO11 on the trash/litter dataset and save weights to models/trash.pt.
 
 Preferred training (YOLO CLI):
-  yolo train model=yolov8n.pt data=models/trash-dataset/data.yaml epochs=20 imgsz=640 device=0 name=trash_run_v1
+  yolo train model=yolo11n.pt data=models/trash-dataset/data.yaml epochs=20 imgsz=640 device=0 name=trash_run_v1
 
 Or via this script:
   py scripts/train_trash_model.py --epochs 20 --imgsz 640
@@ -24,7 +24,7 @@ load_dotenv()
 DATASET_DIR = Path("models/trash-dataset")
 OUTPUT_WEIGHTS = Path("models/trash.pt")
 DATA_YAML = DATASET_DIR / "data.yaml"
-BASE_WEIGHTS = Path("training/checkpoints/litter.pt")
+BASE_WEIGHTS = "yolo11n.pt"
 
 
 def _fix_data_yaml(yaml_path: Path) -> Path:
@@ -83,33 +83,28 @@ def ensure_dataset():
     print(f"Dataset: train={train_n}  valid={val_n}  test={_count_images('test')}")
 
 
-def ensure_base_weights() -> Path:
-    if BASE_WEIGHTS.exists():
-        print(f"Base weights: {BASE_WEIGHTS}")
-        return BASE_WEIGHTS
-
-    from huggingface_hub import hf_hub_download
-
-    BASE_WEIGHTS.parent.mkdir(parents=True, exist_ok=True)
-    print("Downloading litter base weights from Hugging Face…")
-    src = hf_hub_download(
-        repo_id="esapzoi/litter-detection-yolov8",
-        filename="best.pt",
-    )
-    shutil.copy2(src, BASE_WEIGHTS)
-    print(f"Saved base weights → {BASE_WEIGHTS}")
+def ensure_base_weights() -> str:
+    print(f"Base weights: {BASE_WEIGHTS}")
     return BASE_WEIGHTS
 
 
+def _pick_device() -> str:
+    if torch.cuda.is_available():
+        return "0"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def train(epochs: int, imgsz: int, batch: int):
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = _pick_device()
     print(f"Training on device: {device}  epochs={epochs}  imgsz={imgsz}")
 
     ensure_dataset()
     base = ensure_base_weights()
     data_yaml = _fix_data_yaml(DATA_YAML)
 
-    model = YOLO(str(base))
+    model = YOLO(base)
     results = model.train(
         data=str(data_yaml),
         epochs=epochs,
