@@ -9,6 +9,7 @@ Full training (~2-3 hrs on M2):        python3 scripts/train_model.py --epochs 3
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -22,6 +23,8 @@ load_dotenv()
 
 DATASET_DIR = Path("models/smoking-dataset")
 OUTPUT_WEIGHTS = Path("models/smoking.pt")
+BACKUP_WEIGHTS = Path("models/smoking.prev.pt")
+ONNX_OUTPUT = Path("public/models/pretrained.onnx")
 DATA_YAML = DATASET_DIR / "data.yaml"
 
 
@@ -73,13 +76,19 @@ def _pick_device() -> str:
     return "cpu"
 
 
-def train(epochs: int, imgsz: int, batch: int):
+def train(epochs: int, imgsz: int, batch: int, export_onnx: bool = False):
     device = _pick_device()
     print(f"Training on device: {device}  epochs={epochs}  imgsz={imgsz}")
 
     data_yaml = _fix_data_yaml(DATA_YAML)
+    base_weights = OUTPUT_WEIGHTS if OUTPUT_WEIGHTS.exists() else Path("yolo11n.pt")
+    if OUTPUT_WEIGHTS.exists():
+        shutil.copy2(OUTPUT_WEIGHTS, BACKUP_WEIGHTS)
+        print(f"Fine-tuning from {OUTPUT_WEIGHTS} (backup: {BACKUP_WEIGHTS})")
+    else:
+        print(f"Training from scratch with {base_weights}")
 
-    model = YOLO("yolo11n.pt")
+    model = YOLO(str(base_weights))
     results = model.train(
         data=str(data_yaml),
         epochs=epochs,
@@ -89,12 +98,21 @@ def train(epochs: int, imgsz: int, batch: int):
         project="models/runs",
         name="smoking",
         exist_ok=True,
+        patience=10,
         verbose=False,
+        mosaic=1.0,
+        mixup=0.08,
+        close_mosaic=10,
     )
 
     best = Path(results.save_dir) / "weights" / "best.pt"
-    shutil.copy(best, OUTPUT_WEIGHTS)
+    shutil.copy2(best, OUTPUT_WEIGHTS)
     print(f"\nWeights saved to {OUTPUT_WEIGHTS}")
+
+    if export_onnx:
+        subprocess.check_call(
+            [sys.executable, "training/export_onnx.py", "--weights", str(best), "--output", str(ONNX_OUTPUT)]
+        )
 
 
 if __name__ == "__main__":
@@ -102,7 +120,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--export-onnx", action="store_true", help="Export to public/models/pretrained.onnx after training")
     args = parser.parse_args()
 
     download_dataset()
-    train(args.epochs, args.imgsz, args.batch)
+    train(args.epochs, args.imgsz, args.batch, export_onnx=args.export_onnx)
