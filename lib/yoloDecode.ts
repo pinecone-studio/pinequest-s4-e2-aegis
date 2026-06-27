@@ -88,3 +88,38 @@ export function decodeYolo(
 
   return nms(raw);
 }
+
+/** Decode one YOLO class channel directly (avoids argmax suppressing small smoking boxes). */
+export function decodeYoloSingleClass(
+  output: Float32Array,
+  classIdx: number,
+  label: string,
+  threshold: number,
+  numAnchors: number,
+  inputSize = 640,
+): Detection[] {
+  const raw: Detection[] = [];
+
+  for (let a = 0; a < numAnchors; a++) {
+    const cx = output[0 * numAnchors + a];
+    const cy = output[1 * numAnchors + a];
+    const w = output[2 * numAnchors + a];
+    const h = output[3 * numAnchors + a];
+    const score = output[(4 + classIdx) * numAnchors + a];
+
+    if (score < threshold) continue;
+
+    const x1 = Math.max(0, (cx - w / 2) / inputSize);
+    const y1 = Math.max(0, (cy - h / 2) / inputSize);
+    const x2 = Math.min(1, (cx + w / 2) / inputSize);
+    const y2 = Math.min(1, (cy + h / 2) / inputSize);
+
+    raw.push({
+      label: normalizeLabel(label),
+      confidence: score,
+      box: [x1, y1, x2, y2],
+    });
+  }
+
+  return nms(raw);
+}
