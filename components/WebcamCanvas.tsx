@@ -69,7 +69,10 @@ async function captureEvidence(
     form.append("confidence", String(confidence));
     try {
       const res = await fetch("/api/evidence", { method: "POST", body: form });
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") ?? "";
+      const data = contentType.includes("application/json")
+        ? await res.json()
+        : { error: `HTTP ${res.status}` };
       if (res.ok) {
         savedPath = data.saved as string;
         console.log("[evidence] saved", savedPath);
