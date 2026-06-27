@@ -40,6 +40,7 @@ _BOX_COLORS = {
 
 def _run_webcam(source: str) -> None:
     from app.detect_frame import detect_and_track
+    from app.association import Associator
 
     raw = source.strip()
     cap_source = int(raw) if raw.isdigit() else raw
@@ -53,6 +54,7 @@ def _run_webcam(source: str) -> None:
     fps_count = 0
     fps_display = 0.0
     frame_count = 0  # used to skip spurious waitKey events on first frame (macOS Cocoa)
+    associator = Associator()
 
     try:
         while True:
@@ -68,6 +70,18 @@ def _run_webcam(source: str) -> None:
                 logger.warning("detect_and_track error: %s", exc)
                 dets = []
 
+            associator.update(frame_count, dets)
+
+            # Build a map of person_id → current center for line drawing
+            person_centers = {
+                d["track_id"]: (
+                    (d["bbox"][0] + d["bbox"][2]) // 2,
+                    (d["bbox"][1] + d["bbox"][3]) // 2,
+                )
+                for d in dets
+                if d["class"] == "person" and d.get("track_id") is not None
+            }
+
             for det in dets:
                 cls = det["class"]
                 x1, y1, x2, y2 = det["bbox"]
@@ -81,6 +95,17 @@ def _run_webcam(source: str) -> None:
                     (x1, max(y1 - 8, 12)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
                 )
+
+                # Draw ownership line: object → its current owner's position
+                if cls != "person" and track_id is not None:
+                    state = associator.object_states.get(track_id)
+                    if state and state.is_carried and state.owner_id in person_centers:
+                        ocx = (x1 + x2) // 2
+                        ocy = (y1 + y2) // 2
+                        cv2.line(frame, (ocx, ocy), person_centers[state.owner_id],
+                                 (0, 255, 255), 2)
+                    elif state and state.drop_location and not state.is_carried:
+                        cv2.circle(frame, state.drop_location, 8, (0, 80, 255), -1)
 
             fps_count += 1
             elapsed = time.perf_counter() - fps_start
