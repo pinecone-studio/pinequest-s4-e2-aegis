@@ -4,7 +4,8 @@ import {
   LITTER_MODEL_PATH,
   COCO_MODEL_PATH,
   SMOKING_THRESHOLD,
-  SMOKING_CLASS_IDX,
+  CIGARETTE_CLASS_IDX,
+  SMOKING_DECODE_CLASSES,
   LITTER_THRESHOLD,
   COCO_THRESHOLD,
   PERSON_THRESHOLD,
@@ -12,8 +13,8 @@ import {
   COCO_CLASS_NAMES,
   INPUT_SIZE,
 } from "./modelConfig";
-import { decodeYolo, decodeYoloSingleClass, Detection } from "./yoloDecode";
-import { computeCompositeDetections, filterLitterByPersons } from "./rules";
+import { decodeYolo, decodeYoloClasses, Detection } from "./yoloDecode";
+import { computeCompositeDetections, filterLitterByPersons, filterBackgroundLitter } from "./rules";
 import { analyzeMouthRegion, isVisualFalsePositive } from "./smokingVision";
 import type { MouthAnalysis } from "./rules";
 
@@ -86,6 +87,10 @@ function mouthAnalysisFromVideo(
   return {
     smokeLikeRatio: stats.smokeLikeRatio,
     emberRatio: stats.emberRatio,
+    uniformLightRatio: stats.uniformLightRatio,
+    palePaperRatio: stats.palePaperRatio,
+    centerPaleRatio: stats.centerPaleRatio,
+    skinCoverRatio: stats.skinCoverRatio,
     isFalsePositive: isVisualFalsePositive(stats),
   };
 }
@@ -195,12 +200,16 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
     const litterOut = litterResult[litterSession.outputNames[0]];
     const cocoOut = cocoResult[cocoSession.outputNames[0]];
     const numAnchors = smokingOut.dims[2] as number;
+    const numClasses = (smokingOut.dims[1] as number) - 4;
+    const smokingClasses =
+      numClasses >= 3
+        ? SMOKING_DECODE_CLASSES
+        : [{ idx: CIGARETTE_CLASS_IDX, label: "Cigarette" as const }];
 
     const smokingDets = remapDetections(
-      decodeYoloSingleClass(
+      decodeYoloClasses(
         smokingOut.data as Float32Array,
-        SMOKING_CLASS_IDX,
-        "Smoking",
+        smokingClasses,
         SMOKING_THRESHOLD,
         numAnchors,
         INPUT_SIZE,
@@ -231,6 +240,8 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
     const personDetections: Detection[] = SHOW_PERSON_DETECTIONS
       ? cocoDets
           .filter((d) => d.label === "person" && d.confidence >= PERSON_THRESHOLD)
+          .sort((a, b) => b.confidence - a.confidence)
+          .slice(0, 1)
           .map((d) => ({
             label: "Person",
             confidence: d.confidence,
@@ -242,23 +253,27 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
     const cocoPersons = cocoDets
       .filter((d) => d.label === "person")
       .map((d) => d.box);
+    const smokingPersons = cocoPersons;
     const personBoxes = mergePersonBoxes(cocoPersons, cachedPersons);
 
     const { smokingResults } = computeCompositeDetections(
       smokingDets,
-      personBoxes,
+      smokingPersons,
       (box) => mouthAnalysisFromVideo(video, box),
     );
 
     rememberPersons(cocoDets);
-    const filteredLitter = filterLitterByPersons(litterDets, personBoxes);
+    const filteredLitter = filterBackgroundLitter(
+      filterLitterByPersons(litterDets, personBoxes),
+      personBoxes,
+    );
 
     return [
       ...personDetections,
       ...smokingResults.map((r) => ({
-        label: "Smoking",
+        label: r.productLabel,
         confidence: r.compositeScore,
-        box: r.personBox,
+        box: r.cigaretteBox,
       })),
       ...filteredLitter.map((r) => ({
         label: "Litter",
