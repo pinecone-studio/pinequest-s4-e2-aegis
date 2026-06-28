@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -144,6 +145,12 @@ class CameraDiscoveryService(BaseCameraDiscoveryService):
                     raw_outputs.append(raw_output)
                 if on_progress:
                     on_progress(list(cameras))
+
+            unifi_cameras = self._fetch_unifi_cameras()
+            if unifi_cameras:
+                cameras.extend(unifi_cameras)
+                if on_progress:
+                    on_progress(list(cameras))
         except Exception as exc:
             logger.warning("Camera discovery failed: %s", exc)
             message = str(exc)
@@ -228,6 +235,19 @@ class CameraDiscoveryService(BaseCameraDiscoveryService):
                 )
 
         return cameras, "\n".join([str(sweep_output), str(raw_output)])
+
+    def _fetch_unifi_cameras(self) -> List[DiscoveredCamera]:
+        api_key = os.getenv("UNIFI_API_KEY")
+        if not api_key:
+            return []
+
+        try:
+            from app.services.unifi_api import UniFiApiService
+
+            return UniFiApiService(api_key=api_key).fetch_cameras()
+        except Exception as exc:
+            logger.warning("UniFi camera discovery failed: %s", exc)
+            return []
 
     def _probe_rtsp(
         self,
