@@ -4,8 +4,10 @@ import {
   SMOKING_COMPOSITE_THRESHOLD,
   SMOKING_HIGH_CONFIDENCE,
   SMOKING_MOUTH_BOX_MIN,
-  SMOKING_VISUAL_FP_MAX,
+  CIGARETTE_BOX_MAX_AREA,
+  CIGARETTE_BOX_MIN_AREA,
 } from "./modelConfig";
+import { hasRealSmokingEvidence } from "./smokingVision";
 
 export interface SmokingSignals {
   hasHandheldObject: boolean;
@@ -16,7 +18,8 @@ export interface SmokingSignals {
 }
 
 export interface PersonResult {
-  personBox: [number, number, number, number];
+  personBox: Box;
+  cigaretteBox: Box;
   compositeScore: number;
   signals: SmokingSignals;
 }
@@ -28,6 +31,10 @@ export interface CompositeDetections {
 export interface MouthAnalysis {
   smokeLikeRatio: number;
   emberRatio: number;
+  uniformLightRatio: number;
+  palePaperRatio: number;
+  centerPaleRatio: number;
+  skinCoverRatio: number;
   isFalsePositive: boolean;
 }
 
@@ -165,16 +172,49 @@ function expandBox(box: Box, factor: number): Box {
   ];
 }
 
+function isCigaretteSizedBox(box: Box): boolean {
+  const area = boxArea(box);
+  return area >= CIGARETTE_BOX_MIN_AREA && area <= CIGARETTE_BOX_MAX_AREA;
+}
+
+/** Best small smoking-model box on/near mouth or hand while person holds cigarette. */
+function pickCigaretteBox(personBox: Box, smokingDets: Detection[]): Box | null {
+  const [px1, py1, px2, py2] = personBox;
+  const pw = px2 - px1;
+  const ph = py2 - py1;
+  const mouth: Box = [px1 + pw * 0.1, py1 + ph * 0.02, px2 - pw * 0.1, py1 + ph * 0.42];
+  const holdZone: Box = [px1, py1 + ph * 0.2, px2, py2];
+
+  let best: { box: Box; score: number } | null = null;
+
+  for (const det of smokingDets) {
+    if (det.label !== SMOKING_CLASS) continue;
+    if (det.confidence < SMOKING_MOUTH_BOX_MIN) continue;
+    if (!isCigaretteSizedBox(det.box)) continue;
+    if (coverageRatio(personBox, det.box) < 0.12) continue;
+
+    const nearMouth = coverageRatio(mouth, det.box) > 0.15;
+    const inHand = coverageRatio(holdZone, det.box) > 0.12;
+    if (!nearMouth && !inHand) continue;
+
+    const score = det.confidence + (nearMouth ? 0.05 : 0);
+    if (!best || score > best.score) best = { box: det.box, score };
+  }
+
+  return best?.box ?? null;
+}
+
 function mouthSmokingBox(
   personBox: Box,
   smokingDets: Detection[],
-): { found: boolean; score: number } {
+): { found: boolean; score: number; maxBoxArea: number } {
   const [px1, py1, px2, py2] = personBox;
   const pw = px2 - px1;
   const ph = py2 - py1;
   const mouth: Box = [px1 + pw * 0.12, py1 + ph * 0.04, px2 - pw * 0.12, py1 + ph * 0.35];
 
   let best = 0;
+  let maxBoxArea = 0;
   for (const det of smokingDets) {
     if (det.label !== SMOKING_CLASS) continue;
     if (det.confidence < SMOKING_MOUTH_BOX_MIN) continue;
@@ -182,9 +222,10 @@ function mouthSmokingBox(
     if (area > 0.15) continue;
     if (coverageRatio(mouth, det.box) > 0.08) {
       best = Math.max(best, det.confidence);
+      maxBoxArea = Math.max(maxBoxArea, area);
     }
   }
-  return { found: best >= SMOKING_MOUTH_BOX_MIN, score: best };
+  return { found: best >= SMOKING_MOUTH_BOX_MIN, score: best, maxBoxArea };
 }
 
 function scorePersonSmoking(
@@ -192,47 +233,53 @@ function scorePersonSmoking(
   smokingDets: Detection[],
   mouthStats: MouthAnalysis | null,
 ): PersonResult | null {
+  const cigaretteBox = pickCigaretteBox(personBox, smokingDets);
+  if (!cigaretteBox) return null;
+
   let smokingModelScore = 0;
   for (const det of smokingDets) {
     if (det.label !== SMOKING_CLASS) continue;
     if (det.confidence < SMOKING_MODEL_MIN) continue;
-    if (coverageRatio(personBox, det.box) > 0.08) {
+    if (iouBox(det.box, cigaretteBox) > 0.25) {
       smokingModelScore = Math.max(smokingModelScore, det.confidence);
     }
   }
 
   if (smokingModelScore < SMOKING_MODEL_MIN) return null;
 
-  if (
-    mouthStats?.isFalsePositive &&
-    smokingModelScore < SMOKING_VISUAL_FP_MAX
-  ) {
-    return null;
-  }
+  if (mouthStats?.isFalsePositive) return null;
 
   const mouthBox = mouthSmokingBox(personBox, smokingDets);
-  let score = smokingModelScore;
-
-  if (mouthBox.found) {
-    score = Math.min(1, score + mouthBox.score * 0.2);
-  }
-
-  const smokeLikeRatio = mouthStats?.smokeLikeRatio ?? 0;
   const emberRatio = mouthStats?.emberRatio ?? 0;
+  if (mouthBox.maxBoxArea > 0.07 && emberRatio < 0.015) return null;
 
-  if (smokeLikeRatio > 0.05) {
-    score = Math.min(1, score + Math.min(0.15, smokeLikeRatio * 0.35));
+  const mouthPixels = mouthStats
+    ? {
+        solidRedRatio: 0,
+        uniformLightRatio: mouthStats.uniformLightRatio,
+        palePaperRatio: mouthStats.palePaperRatio,
+        centerPaleRatio: mouthStats.centerPaleRatio,
+        skinCoverRatio: mouthStats.skinCoverRatio,
+        smokeLikeRatio: mouthStats.smokeLikeRatio,
+        emberRatio: mouthStats.emberRatio,
+        redClusterMaxRatio: 0,
+      }
+    : null;
+
+  if (!hasRealSmokingEvidence(mouthPixels, smokingModelScore)) return null;
+
+  let score = smokingModelScore;
+  const smokeLikeRatio = mouthStats?.smokeLikeRatio ?? 0;
+
+  if (mouthBox.found && emberRatio > 0.012) {
+    score = Math.min(1, score + mouthBox.score * 0.15);
   }
-  if (emberRatio > 0.012) {
+
+  if (smokeLikeRatio > 0.1 && emberRatio > 0.01) {
+    score = Math.min(1, score + Math.min(0.1, smokeLikeRatio * 0.2));
+  }
+  if (emberRatio > 0.015) {
     score = Math.min(1, score + Math.min(0.12, emberRatio * 3));
-  }
-
-  const hasVisualEvidence =
-    mouthBox.found || smokeLikeRatio > 0.06 || emberRatio > 0.015;
-
-  // Require mouth-level cue or smoke pixels unless model is very confident.
-  if (!hasVisualEvidence && smokingModelScore < SMOKING_HIGH_CONFIDENCE) {
-    return null;
   }
 
   if (score < SMOKING_COMPOSITE_THRESHOLD && smokingModelScore < SMOKING_HIGH_CONFIDENCE) {
@@ -241,6 +288,7 @@ function scorePersonSmoking(
 
   return {
     personBox,
+    cigaretteBox,
     compositeScore: Math.min(1, score),
     signals: {
       hasHandheldObject: false,
@@ -256,6 +304,27 @@ function smokingMatchedPerson(smokingBox: Box, personBoxes: Box[]): boolean {
   return personBoxes.some((person) => coverageRatio(person, smokingBox) > 0.08);
 }
 
+function dedupePersonBoxes(boxes: Box[]): Box[] {
+  const sorted = [...boxes].sort((a, b) => boxArea(b) - boxArea(a));
+  const kept: Box[] = [];
+
+  for (const box of sorted) {
+    const overlaps = kept.some((k) => iouBox(k, box) > 0.45);
+    if (!overlaps) kept.push(box);
+  }
+  return kept;
+}
+
+function iouBox(a: Box, b: Box): number {
+  const x1 = Math.max(a[0], b[0]);
+  const y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[2], b[2]);
+  const y2 = Math.min(a[3], b[3]);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const union = boxArea(a) + boxArea(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
 /**
  * Smoking from YOLO class-1 boxes + optional COCO person boxes.
  * Also emits direct smoking hits when COCO misses the person.
@@ -265,35 +334,43 @@ export function computeCompositeDetections(
   personBoxes: Box[],
   analyzeMouth?: (personBox: Box) => MouthAnalysis | null,
 ): CompositeDetections {
+  const uniquePersons = dedupePersonBoxes(personBoxes);
   const smokingResults: PersonResult[] = [];
-  const usedPersons = new Set<number>();
 
-  for (let i = 0; i < personBoxes.length; i++) {
-    const personBox = personBoxes[i];
+  for (const personBox of uniquePersons) {
     const mouthStats = analyzeMouth?.(personBox) ?? null;
     const result = scorePersonSmoking(personBox, smokingDets, mouthStats);
-    if (result) {
-      smokingResults.push(result);
-      usedPersons.add(i);
-    }
+    if (result) smokingResults.push(result);
   }
 
   for (const det of smokingDets) {
     if (det.label !== SMOKING_CLASS || det.confidence < SMOKING_MODEL_MIN) continue;
-    if (smokingMatchedPerson(det.box, personBoxes)) continue;
+    if (smokingMatchedPerson(det.box, uniquePersons)) continue;
     if (det.confidence < SMOKING_HIGH_CONFIDENCE) continue;
+    if (!isCigaretteSizedBox(det.box)) continue;
 
-    const displayBox = expandBox(det.box, 4);
-    const mouthStats = analyzeMouth?.(displayBox) ?? null;
+    const analysisBox = expandBox(det.box, 6);
+    const mouthStats = analyzeMouth?.(analysisBox) ?? null;
     if (mouthStats?.isFalsePositive) continue;
 
-    const hasCue =
-      mouthStats &&
-      (mouthStats.smokeLikeRatio > 0.06 || mouthStats.emberRatio > 0.015);
-    if (!hasCue) continue;
+    const mouthPixels = mouthStats
+      ? {
+          solidRedRatio: 0,
+          uniformLightRatio: mouthStats.uniformLightRatio,
+          palePaperRatio: mouthStats.palePaperRatio,
+          centerPaleRatio: mouthStats.centerPaleRatio,
+          skinCoverRatio: mouthStats.skinCoverRatio,
+          smokeLikeRatio: mouthStats.smokeLikeRatio,
+          emberRatio: mouthStats.emberRatio,
+          redClusterMaxRatio: 0,
+        }
+      : null;
+
+    if (!hasRealSmokingEvidence(mouthPixels, det.confidence)) continue;
 
     smokingResults.push({
-      personBox: displayBox,
+      personBox: det.box,
+      cigaretteBox: det.box,
       compositeScore: det.confidence,
       signals: {
         hasHandheldObject: false,
@@ -305,5 +382,10 @@ export function computeCompositeDetections(
     });
   }
 
-  return { smokingResults };
+  if (smokingResults.length <= 1) return { smokingResults };
+
+  const best = smokingResults.reduce((a, b) =>
+    a.compositeScore >= b.compositeScore ? a : b,
+  );
+  return { smokingResults: [best] };
 }
