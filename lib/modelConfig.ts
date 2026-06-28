@@ -10,8 +10,11 @@ export const COCO_MODEL_PATH = "/models/coco.onnx";
 export const SMOKING_THRESHOLD = 0.28;
 export const SMOKING_MODEL_MIN = 0.32;
 export const SMOKING_COMPOSITE_THRESHOLD = 0.38;
-export const SMOKING_HIGH_CONFIDENCE = 0.72;
+export const SMOKING_HIGH_CONFIDENCE = 0.82;
 export const SMOKING_MOUTH_BOX_MIN = 0.28;
+/** Normalized area bounds for a cigarette/handheld smoking box. */
+export const CIGARETTE_BOX_MAX_AREA = 0.065;
+export const CIGARETTE_BOX_MIN_AREA = 0.0003;
 /** Only reject toy/red-light pixels below this model score. */
 export const SMOKING_VISUAL_FP_MAX = 0.55;
 export const LITTER_THRESHOLD = 0.48;

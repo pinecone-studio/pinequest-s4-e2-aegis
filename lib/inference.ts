@@ -86,6 +86,10 @@ function mouthAnalysisFromVideo(
   return {
     smokeLikeRatio: stats.smokeLikeRatio,
     emberRatio: stats.emberRatio,
+    uniformLightRatio: stats.uniformLightRatio,
+    palePaperRatio: stats.palePaperRatio,
+    centerPaleRatio: stats.centerPaleRatio,
+    skinCoverRatio: stats.skinCoverRatio,
     isFalsePositive: isVisualFalsePositive(stats),
   };
 }
@@ -231,6 +235,8 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
     const personDetections: Detection[] = SHOW_PERSON_DETECTIONS
       ? cocoDets
           .filter((d) => d.label === "person" && d.confidence >= PERSON_THRESHOLD)
+          .sort((a, b) => b.confidence - a.confidence)
+          .slice(0, 1)
           .map((d) => ({
             label: "Person",
             confidence: d.confidence,
@@ -242,11 +248,12 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
     const cocoPersons = cocoDets
       .filter((d) => d.label === "person")
       .map((d) => d.box);
+    const smokingPersons = cocoPersons;
     const personBoxes = mergePersonBoxes(cocoPersons, cachedPersons);
 
     const { smokingResults } = computeCompositeDetections(
       smokingDets,
-      personBoxes,
+      smokingPersons,
       (box) => mouthAnalysisFromVideo(video, box),
     );
 
@@ -258,7 +265,7 @@ export async function runInference(video: HTMLVideoElement): Promise<Detection[]
       ...smokingResults.map((r) => ({
         label: "Smoking",
         confidence: r.compositeScore,
-        box: r.personBox,
+        box: r.cigaretteBox,
       })),
       ...filteredLitter.map((r) => ({
         label: "Litter",

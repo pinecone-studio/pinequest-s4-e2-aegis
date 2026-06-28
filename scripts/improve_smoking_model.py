@@ -64,6 +64,22 @@ def merge_custom_data(auto_label: bool) -> None:
     subprocess.check_call(cmd, cwd=str(ROOT))
 
 
+def merge_cigarette_data(auto_label: bool) -> None:
+    script = ROOT / "scripts" / "prepare_cigarette_training.py"
+    cmd = [sys.executable, str(script), "--force"]
+    if auto_label:
+        cmd.append("--auto-label")
+    subprocess.check_call(cmd, cwd=str(ROOT))
+
+
+def merge_smoke_data(auto_label: bool) -> None:
+    script = ROOT / "scripts" / "prepare_smoke_training.py"
+    cmd = [sys.executable, str(script), "--force"]
+    if auto_label:
+        cmd.append("--auto-label")
+    subprocess.check_call(cmd, cwd=str(ROOT))
+
+
 def merge_hard_negatives() -> int:
     neg_script = ROOT / "scripts" / "add_hard_negatives.py"
     if not HARD_NEGATIVES.is_dir():
@@ -98,23 +114,23 @@ def train(epochs: int, imgsz: int, batch: int) -> Path:
         batch=batch,
         device=device,
         project=str(ROOT / "models" / "runs"),
-        name="smoking_improved",
+        name="smoking_cigarette",
         exist_ok=True,
-        patience=15,
+        patience=12,
         verbose=True,
-        lr0=0.005,
+        lr0=0.003,
         lrf=0.01,
-        mosaic=1.0,
-        mixup=0.1,
+        mosaic=0.8,
+        mixup=0.05,
         copy_paste=0.0,
         hsv_h=0.015,
-        hsv_s=0.7,
-        hsv_v=0.4,
-        degrees=15,
-        translate=0.15,
-        scale=0.6,
+        hsv_s=0.6,
+        hsv_v=0.35,
+        degrees=10,
+        translate=0.1,
+        scale=0.4,
         fliplr=0.5,
-        close_mosaic=15,
+        close_mosaic=10,
         cache=True,
     )
 
@@ -176,6 +192,8 @@ def main() -> None:
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--skip-custom", action="store_true", help="Skip models/custom-smoking/ import")
+    parser.add_argument("--skip-smoke", action="store_true", help="Skip expanded smoke-folder import")
+    parser.add_argument("--cigarette-only", action="store_true", help="Use tight cigarette labels only")
     parser.add_argument("--skip-negatives", action="store_true", help="Skip models/hard-negatives/ import")
     parser.add_argument("--auto-label", action="store_true", help="Auto-label positive custom images")
     parser.add_argument("--skip-export", action="store_true")
@@ -186,8 +204,13 @@ def main() -> None:
 
     download_dataset()
 
-    if not args.skip_custom:
+    if not args.skip_custom and not args.cigarette_only:
         merge_custom_data(auto_label=args.auto_label)
+
+    if args.cigarette_only:
+        merge_cigarette_data(auto_label=args.auto_label)
+    elif not args.skip_smoke:
+        merge_smoke_data(auto_label=args.auto_label)
 
     if not args.skip_negatives:
         merge_hard_negatives()
