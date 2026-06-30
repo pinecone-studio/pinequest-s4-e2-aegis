@@ -7,4 +7,6 @@ export interface EvidenceEvent {
   thumb: string; // data URL preview
   savedPath: string | null; // server path under evidence/, or null if save failed
   saveError?: string;
+  note?: string; // the VLM's free-text reasoning — "what the AI thought" for this frame
+  info?: boolean; // true = AI observation only (no violation, not saved to disk)
 }

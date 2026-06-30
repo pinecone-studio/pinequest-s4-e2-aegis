@@ -20,12 +20,12 @@ const USER_PROMPT = `You monitor for SMOKING and LITTERING. Your priority is fin
 - "Litter": a bottle, can, cup, wrapper, bag, or plastic item being held about to be dropped, mid-drop, or already lying discarded.
 - "Person": each visible person (secondary — context only).
 
-Examine hands and the mouth region carefully before deciding. Smoking and litter objects are small; do not ignore them just because they are small. It is fine to report a Cigarette/Vape/Litter with lower confidence (e.g. 0.4) if you are unsure — express your uncertainty in the confidence value rather than omitting it.
+Be conservative: only report a Cigarette/Vape/Litter when you can CLEARLY see it. A hand near the face, a finger, a phone, a pen, jewelry, or fast movement (e.g. dancing) is NOT a cigarette — do not report one unless an actual cigarette/vape is visible. When in doubt, do NOT report it. Only assign confidence above 0.7 when you are genuinely confident.
 
 Respond with a JSON object of this exact shape:
-{"detections":[{"label":"Cigarette|Vape|Litter|Person","confidence":0.0-1.0,"box":[x_min,y_min,x_max,y_max]}]}
+{"summary":"one short sentence describing what you see and whether anything is illegal","detections":[{"label":"Cigarette|Vape|Litter|Person","confidence":0.0-1.0,"box":[x_min,y_min,x_max,y_max]}]}
 
-Coordinates are normalized 0.0-1.0, origin at top-left. If nothing is present, return {"detections":[]}.`;
+The "summary" is always required — describe the scene in plain language (e.g. "A person standing, no smoking or littering" or "A person holding a lit cigarette near their mouth"). Coordinates are normalized 0.0-1.0, origin at top-left. If nothing is present, return {"summary":"...","detections":[]}.`;
 
 interface RawBox {
   label?: string;
@@ -164,7 +164,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       .map(toDetection)
       .filter((d): d is Detection => d !== null);
 
-    return NextResponse.json({ detections });
+    const summary =
+      typeof (parsed as { summary?: unknown })?.summary === "string"
+        ? ((parsed as { summary: string }).summary).slice(0, 240)
+        : "";
+
+    return NextResponse.json({ detections, summary });
   } catch (err) {
     const message = err instanceof Error ? err.message : "detection failed";
     console.error("[detect] error", message);

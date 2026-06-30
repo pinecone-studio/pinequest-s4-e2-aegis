@@ -72,6 +72,7 @@ export async function captureEvidenceFromSource(
   kind: ViolationKind,
   confidence: number,
   onEvent?: (event: EvidenceEvent) => void,
+  note?: string,
 ): Promise<void> {
   const { width: w, height: h } = getSourceSize(source);
   if (!w || !h) return;
@@ -130,6 +131,7 @@ export async function captureEvidenceFromSource(
     thumb,
     savedPath,
     saveError,
+    note,
   });
 }
 
