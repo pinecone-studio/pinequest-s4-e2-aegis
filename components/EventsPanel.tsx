@@ -63,7 +63,7 @@ export default function EventsPanel({ events, live = false }: Props) {
         ) : (
           events.map((ev) => {
             const pct = Math.round(ev.confidence * 100);
-            const color = colorFor(ev.label);
+            const color = ev.info ? "#8a8a8a" : colorFor(ev.label);
             return (
               <div
                 key={ev.id}
@@ -78,15 +78,30 @@ export default function EventsPanel({ events, live = false }: Props) {
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center justify-between mb-1">
                     <span
-                      className="font-bold text-[12px] uppercase tracking-[0.04em]"
+                      className="font-bold text-[12px] uppercase tracking-[0.04em] flex items-center gap-1.5"
                       style={{ color }}
                     >
+                      {ev.info ? (
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <circle cx="12" cy="12" r="10" /><path d="M12 16v-4M12 8h.01" />
+                        </svg>
+                      ) : null}
                       {ev.label}
                     </span>
-                    <span className="text-[13px] font-bold" style={{ color }}>
-                      {pct}%
-                    </span>
+                    {ev.info ? null : (
+                      <span className="text-[13px] font-bold" style={{ color }}>
+                        {pct}%
+                      </span>
+                    )}
                   </div>
+                  {ev.note ? (
+                    <div
+                      className="text-[11.5px] text-[#c4c4c4] italic leading-snug mb-1"
+                      title={ev.note}
+                    >
+                      &ldquo;{ev.note}&rdquo;
+                    </div>
+                  ) : null}
                   <div className="text-[12px] text-[#8a8a8a]">
                     {formatTime(ev.time)}
                   </div>
@@ -99,15 +114,17 @@ export default function EventsPanel({ events, live = false }: Props) {
                     </svg>
                     {ev.source}
                   </div>
-                  <div
-                    className="text-[11px] mt-[3px] overflow-hidden text-ellipsis whitespace-nowrap"
-                    style={{ color: ev.savedPath ? "#22c55e" : "#eab308" }}
-                    title={ev.savedPath ?? ev.saveError}
-                  >
-                    {ev.savedPath
-                      ? `✓ saved • ${ev.savedPath.split(/[\\/]/).pop()}`
-                      : `⚠ not saved${ev.saveError ? ` • ${ev.saveError}` : ""}`}
-                  </div>
+                  {ev.info ? null : (
+                    <div
+                      className="text-[11px] mt-[3px] overflow-hidden text-ellipsis whitespace-nowrap"
+                      style={{ color: ev.savedPath ? "#22c55e" : "#eab308" }}
+                      title={ev.savedPath ?? ev.saveError}
+                    >
+                      {ev.savedPath
+                        ? `✓ saved • ${ev.savedPath.split(/[\\/]/).pop()}`
+                        : `⚠ not saved${ev.saveError ? ` • ${ev.saveError}` : ""}`}
+                    </div>
+                  )}
                 </div>
               </div>
             );
