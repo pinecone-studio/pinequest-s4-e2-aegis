@@ -32,3 +32,4 @@ models/vape-cigarette-supplement/
 # YAMNet local cache (downloaded by TensorFlow Hub or manually)
 models/yamnet_cache/
 models/yamnet/
+tsconfig.tsbuildinfo
