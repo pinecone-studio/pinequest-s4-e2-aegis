@@ -72,16 +72,14 @@ export default function CameraCard({
 
   const streamUrl = buildCameraStreamUrl(camera);
   const snapshotUrl = scan.snapshotUrl;
-  const imageLoaded = Boolean(snapshotUrl);
-  const streamActive =
-    camera.enabled !== false && (streamState === "loading" || streamState === "online");
-  const showStream = streamActive;
-  const showAi = aiReady && streamState === "online" && imageLoaded;
-  const analyzing = scan.analyzing;
-
+  const hasCachedFrame = Boolean(snapshotUrl);
+  const isOnline = scan.status === "online" || streamState === "online";
+  const isUnavailable = scan.status === "unavailable" || streamState === "stream_unavailable";
   const isDisabled = camera.enabled === false;
-  const isUnavailable = streamState === "stream_unavailable";
-  const isOnline = streamState === "online";
+  const streamActive = camera.enabled !== false && !isUnavailable;
+  const showStream = streamActive;
+  const showAi = aiReady && isOnline && hasCachedFrame;
+  const analyzing = scan.analyzing;
 
   const liveActive = liveStream && isOnline && inView && !gridPaused && Boolean(streamUrl);
   const mjpegSrc = `/api/stream/mjpeg?${new URLSearchParams({
@@ -179,7 +177,7 @@ export default function CameraCard({
         <>
           {snapshotUrl ? (
             <img
-              key={`${camera.id}:${scan.lastScanAt ?? 0}`}
+              key={`${camera.id}:${scan.lastScanAt ?? "pending"}`}
               ref={imgRef}
               src={snapshotUrl}
               alt={cameraTitle(camera)}
@@ -195,7 +193,7 @@ export default function CameraCard({
               className="absolute inset-0 block h-full w-full object-cover"
             />
           ) : null}
-          {streamState === "loading" && !imageLoaded ? (
+          {!hasCachedFrame && scan.status === "loading" ? (
             <div className="absolute inset-0 flex items-center justify-center overflow-hidden bg-[#0d0d0d]">
               <div className="absolute inset-0 bg-[linear-gradient(110deg,#0d0d0d_0%,#181818_42%,#0d0d0d_78%)] opacity-80 animate-pulse" />
               <span className="relative text-[#8a8a8a] text-[12px] tracking-[0.08em]">

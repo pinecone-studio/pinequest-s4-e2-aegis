@@ -1,48 +1,16 @@
-"use client";
-
 import { extractRtspUrlFromStreamReference } from "./rtspUtils";
 
 export const GRID_SNAPSHOT_POLL_MS = 4000;
 export const GRID_SNAPSHOT_JITTER_MS = 1000;
 export const BACKGROUND_SNAPSHOT_POLL_MS = GRID_SNAPSHOT_POLL_MS;
 export const BACKGROUND_SNAPSHOT_JITTER_MS = GRID_SNAPSHOT_JITTER_MS;
+
 const MAX_CONCURRENT_SNAPSHOT_FETCHES = 2;
 const SNAPSHOT_TIMEOUT_MS = 10000;
 const QUIET_SNAPSHOT_STATUSES = new Set([401, 503]);
 const QUIET_LOG_COOLDOWN_MS = 30_000;
 
 const lastQuietLogAt = new Map<string, number>();
-
-function handleSnapshotHttpFailure(cameraId: string, status: number): void {
-  if (!QUIET_SNAPSHOT_STATUSES.has(status)) return;
-
-  const key = `${cameraId}:${status}`;
-  const now = Date.now();
-  const lastLoggedAt = lastQuietLogAt.get(key) ?? 0;
-  if (now - lastLoggedAt < QUIET_LOG_COOLDOWN_MS) return;
-
-  lastQuietLogAt.set(key, now);
-  const reason = status === 401 ? "unauthorized" : "offline";
-  console.warn(`[Snapshot]: Camera ${cameraId} is ${reason} (${status}). Skipping...`);
-}
-
-async function fetchSnapshotBlob(
-  subscription: SnapshotSubscription,
-  signal: AbortSignal,
-): Promise<Blob | null> {
-  const response = await fetch(snapshotEndpoint(subscription), {
-    cache: "no-store",
-    signal,
-  });
-
-  if (!response.ok) {
-    handleSnapshotHttpFailure(subscription.cameraId, response.status);
-    return null;
-  }
-
-  const blob = await response.blob();
-  return blob.size > 0 ? blob : null;
-}
 
 interface SnapshotSubscription {
   active: boolean;
@@ -63,6 +31,51 @@ interface SnapshotTask {
 const queue: SnapshotTask[] = [];
 let activeFetches = 0;
 let drainScheduled = false;
+
+function handleSnapshotHttpFailure(cameraId: string, status: number): void {
+  if (!QUIET_SNAPSHOT_STATUSES.has(status)) return;
+
+  const key = `${cameraId}:${status}`;
+  const now = Date.now();
+  const lastLoggedAt = lastQuietLogAt.get(key) ?? 0;
+  if (now - lastLoggedAt < QUIET_LOG_COOLDOWN_MS) return;
+
+  lastQuietLogAt.set(key, now);
+  const reason = status === 401 ? "unauthorized" : "offline";
+  console.warn(`[Snapshot]: Camera ${cameraId} is ${reason} (${status}). Skipping...`);
+}
+
+function buildSnapshotUrl(cameraId: string, streamUrl: string): string {
+  const rtspDirect = extractRtspUrlFromStreamReference(streamUrl);
+  const params = new URLSearchParams({
+    cameraId,
+    v: String(Date.now()),
+  });
+  params.set("streamUrl", rtspDirect ?? streamUrl);
+  return `/api/snapshot/rtsp?${params.toString()}`;
+}
+
+function snapshotEndpoint(subscription: SnapshotSubscription): string {
+  return buildSnapshotUrl(subscription.cameraId, subscription.streamUrl);
+}
+
+async function fetchSnapshotBlob(
+  subscription: SnapshotSubscription,
+  signal: AbortSignal,
+): Promise<Blob | null> {
+  const response = await fetch(snapshotEndpoint(subscription), {
+    cache: "no-store",
+    signal,
+  });
+
+  if (!response.ok) {
+    handleSnapshotHttpFailure(subscription.cameraId, response.status);
+    return null;
+  }
+
+  const blob = await response.blob();
+  return blob.size > 0 ? blob : null;
+}
 
 export function subscribeToSnapshots({
   cameraId,
@@ -172,16 +185,6 @@ async function runTask({ subscription }: SnapshotTask) {
   }
 }
 
-function snapshotEndpoint(subscription: SnapshotSubscription): string {
-  const rtspDirect = extractRtspUrlFromStreamReference(subscription.streamUrl);
-  const params = new URLSearchParams({
-    cameraId: subscription.cameraId,
-    v: String(Date.now()),
-  });
-  params.set("streamUrl", rtspDirect ?? subscription.streamUrl);
-  return `/api/snapshot/rtsp?${params.toString()}`;
-}
-
 /** Convert a JPEG snapshot blob into a data-URL base64 string for YOLO/LitServe. */
 export async function blobToBase64DataUrl(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -204,15 +207,8 @@ export async function fetchSnapshotAsBase64(
   streamUrl: string,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  const params = new URLSearchParams({
-    cameraId,
-    v: String(Date.now()),
-  });
-  const rtspDirect = extractRtspUrlFromStreamReference(streamUrl);
-  params.set("streamUrl", rtspDirect ?? streamUrl);
-
   try {
-    const response = await fetch(`/api/snapshot/rtsp?${params.toString()}`, {
+    const response = await fetch(buildSnapshotUrl(cameraId, streamUrl), {
       cache: "no-store",
       signal,
     });

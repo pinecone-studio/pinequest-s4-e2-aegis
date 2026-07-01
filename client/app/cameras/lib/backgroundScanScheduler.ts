@@ -132,8 +132,7 @@ async function runTask({ subscription }: ScanTask) {
 
     if (!base64Image) {
       subscription.consecutiveFailures += 1;
-      const current = subscription.consecutiveFailures;
-      if (current >= UNAVAILABLE_AFTER_FAILURES) {
+      if (subscription.consecutiveFailures >= UNAVAILABLE_AFTER_FAILURES) {
         patchCameraScanState(cameraId, { status: "unavailable" });
       }
       return;
@@ -149,10 +148,15 @@ async function runTask({ subscription }: ScanTask) {
     if (subscription.aiReady) {
       const result = await postYoloFilter(cameraId, base64Image, controller.signal);
       if (!subscription.active || !result) return;
+
       if (result.has_person) {
         console.log(`[yolo:${cameraId}] person detected`);
       }
-      patchCameraScanState(cameraId, { hasPerson: result.has_person === true });
+
+      patchCameraScanState(cameraId, {
+        hasPerson: result.has_person === true,
+        yoloImage: result.has_person ? (result.image ?? base64Image) : null,
+      });
     }
   } finally {
     clearTimeout(timeout);

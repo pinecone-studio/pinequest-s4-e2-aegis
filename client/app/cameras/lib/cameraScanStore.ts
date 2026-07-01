@@ -9,6 +9,7 @@ export interface CameraScanState {
   snapshotUrl: string | null;
   analyzing: boolean;
   hasPerson: boolean;
+  yoloImage: string | null;
   lastScanAt: number | null;
 }
 
@@ -17,6 +18,7 @@ const DEFAULT_STATE: CameraScanState = {
   snapshotUrl: null,
   analyzing: false,
   hasPerson: false,
+  yoloImage: null,
   lastScanAt: null,
 };
 

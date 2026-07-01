@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CameraCard from "./CameraCard";
 import CameraExpandDialog from "./CameraExpandDialog";
+import { getCameraScanState } from "../lib/cameraScanStore";
 import type { CameraView } from "../lib/cameraTypes";
 import type { EvidenceEvent } from "@/lib/evidence";
 
@@ -91,7 +92,14 @@ export default function CameraGrid({
       let changed = false;
 
       for (const cameraId of loadableCameraIds) {
-        next[cameraId] = current[cameraId] ?? "not_started";
+        const cached = getCameraScanState(cameraId);
+        const cachedState =
+          cached.status === "online"
+            ? "online"
+            : cached.status === "unavailable"
+              ? "stream_unavailable"
+              : (current[cameraId] ?? "not_started");
+        next[cameraId] = cachedState;
         if (next[cameraId] !== current[cameraId]) {
           changed = true;
         }
@@ -153,7 +161,9 @@ export default function CameraGrid({
 
   const handleExpandCamera = (cameraId: string) => {
     setExpandedCameraId(cameraId);
-    setExpandedPreviewUrl(snapshotPreviewRef.current[cameraId] ?? null);
+    setExpandedPreviewUrl(
+      snapshotPreviewRef.current[cameraId] ?? getCameraScanState(cameraId).snapshotUrl,
+    );
     onSelect?.(cameraId);
   };
 
