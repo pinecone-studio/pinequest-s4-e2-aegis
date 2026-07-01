@@ -13,7 +13,7 @@ import {
   VAPE_KIND,
 } from "@/lib/cameraAiUtils";
 
-const STREAM_LOAD_TIMEOUT_MS = 25000;
+const STREAM_LOAD_TIMEOUT_MS = 18000;
 const CAPTURE_COOLDOWN_MS = 8000;
 
 // --- Cloud vision detection (Gemini) --------------------------------------

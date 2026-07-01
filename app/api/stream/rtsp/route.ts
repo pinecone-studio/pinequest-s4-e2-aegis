@@ -6,7 +6,12 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 const BOUNDARY = MJPEG_BOUNDARY;
-const OPEN_TIMEOUT_MS = 12000;
+// Per-attempt open timeout. A reachable camera opens well under this; keep it
+// tight so unreachable hosts free up the client's load queue quickly.
+const OPEN_TIMEOUT_MS = 8000;
+// Overall budget across ALL path/password fallback attempts, so one camera
+// can't tie up a request (and a grid load slot) through many slow attempts.
+const TOTAL_OPEN_TIMEOUT_MS = 15000;
 
 // How long to remember that a given RTSP URL failed to open, so we don't
 // respawn a Python/FFmpeg decoder on every retry for a camera that is (for
@@ -71,9 +76,11 @@ export async function GET(request: Request) {
   const pathCandidates = buildPathList(rtspUrl);
   const passwordCandidates = buildPasswordList(rtspUrl);
   let result: OpenResult = { opened: false, reason: "could not open RTSP stream", aborted: false };
+  const deadline = Date.now() + TOTAL_OPEN_TIMEOUT_MS;
 
   outer: for (const path of pathCandidates) {
     for (const password of passwordCandidates) {
+      if (Date.now() >= deadline) break outer; // out of fallback budget
       result = await openStreamDecoder({
         host,
         candidate: {

@@ -5,7 +5,10 @@ import CameraCard from "./CameraCard";
 import type { CameraView } from "../lib/cameraTypes";
 import type { EvidenceEvent } from "@/lib/evidence";
 
-const MAX_ACTIVE_STREAM_LOADS = 10;
+// Concurrent stream-open attempts. Kept high so a handful of slow-failing
+// cameras can't stall the working ones behind them in the load queue (failed
+// opens now free their slot within ~15s max — see the stream route deadline).
+const MAX_ACTIVE_STREAM_LOADS = 24;
 const MAX_AI_CAMERAS = 3;
 
 export type StreamLoadState = "not_started" | "loading" | "online" | "stream_unavailable";
