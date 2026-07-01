@@ -149,7 +149,7 @@ function startFfmpeg(entry: PoolEntry) {
       "error",
       "-rtsp_transport",
       "tcp",
-      "-stimeout",
+      "-timeout",
       "8000000",
       "-i",
       entry.rtspUrl,
