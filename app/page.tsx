@@ -19,11 +19,8 @@ import {
   saveGlobalCredentials,
 } from "./cameras/lib/applyCameraCredentials";
 import type { CameraView } from "./cameras/lib/cameraTypes";
-import { loadModels, activeBackend } from "@/lib/inference";
 import type { EvidenceEvent } from "@/lib/evidence";
-import ModelStatusBadge from "@/components/ModelStatusBadge";
 import EventsPanel from "@/components/EventsPanel";
-import WebcamCard from "./cameras/components/WebcamCard";
 
 const MAX_EVENTS = 50;
 const DISCOVERY_POLL_INTERVAL_MS = 2000;
@@ -48,7 +45,6 @@ function cameraLabel(camera: CameraView) {
 }
 
 export default function HomePage() {
-  const [modelState, setModelState] = useState<"loading" | "ready" | "error">("loading");
   const [events, setEvents] = useState<EvidenceEvent[]>([]);
   const [cameras, setCameras] = useState<CameraView[]>([]);
   const [cameraLoadError, setCameraLoadError] = useState<string | null>(null);
@@ -66,28 +62,18 @@ export default function HomePage() {
   const [credentialsModalCameraId, setCredentialsModalCameraId] = useState<string | null>(null);
   const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus>("completed");
   const [isStartingScan, setIsStartingScan] = useState(false);
-  const [webcamOn, setWebcamOn] = useState(false);
+  const [scanOverlayDismissed, setScanOverlayDismissed] = useState(false);
   const credentialsModalOpen = credentialsModalCameraId !== null;
   const credentialsModalOpenRef = useRef(false);
   credentialsModalOpenRef.current = credentialsModalOpen;
 
   const isScanning = discoveryStatus === "running";
-  const showScanOverlay = isScanning || isStartingScan;
+  // The overlay follows the scan status, but the user can always dismiss it
+  // (a stalled scan shouldn't trap them behind a full-screen blocker).
+  const showScanOverlay = (isScanning || isStartingScan) && !scanOverlayDismissed;
 
   const handleEvent = useCallback((event: EvidenceEvent) => {
     setEvents((prev) => [event, ...prev].slice(0, MAX_EVENTS));
-  }, []);
-
-  useEffect(() => {
-    loadModels()
-      .then(() => {
-        console.info("[inference] backend:", activeBackend);
-        setModelState("ready");
-      })
-      .catch((err) => {
-        console.error("Model load failed:", err);
-        setModelState("error");
-      });
   }, []);
 
   useEffect(() => {
@@ -212,6 +198,7 @@ export default function HomePage() {
     if (isScanning || isStartingScan) return;
 
     setIsStartingScan(true);
+    setScanOverlayDismissed(false);
     setCameraLoadError(null);
     setDiscoveryStatus("running");
     setCameras([]);
@@ -301,7 +288,14 @@ export default function HomePage() {
       }
 
       const nextStatus = await tick();
-      if (!nextStatus || TERMINAL_DISCOVERY_STATUSES.includes(nextStatus)) {
+      if (!nextStatus) {
+        // Results fetch failed (service unreachable/error). Don't leave the
+        // status stuck on "running" — mark it failed so the overlay clears.
+        if (!credentialsModalOpenRef.current) setDiscoveryStatus("failed");
+        stopPolling();
+        return;
+      }
+      if (TERMINAL_DISCOVERY_STATUSES.includes(nextStatus)) {
         stopPolling();
       }
     }, DISCOVERY_POLL_INTERVAL_MS);
@@ -355,6 +349,13 @@ export default function HomePage() {
               />
               <div className="text-[16px] font-semibold text-[#e8e8e8]">Scanning local network for IP cameras…</div>
               <div className="text-[13px] text-[#8a8a8a] max-w-[360px] leading-normal">Searching all connected networks for RTSP devices.</div>
+              <button
+                type="button"
+                onClick={() => setScanOverlayDismissed(true)}
+                className="mt-1 h-9 px-4 rounded-[9px] border border-[#333] bg-[#1a1a1a] text-[13px] text-[#e8e8e8] cursor-pointer hover:border-[#f0652c] hover:text-[#f0652c] transition-colors"
+              >
+                Cancel
+              </button>
             </div>
           ) : null}
 
@@ -432,29 +433,11 @@ export default function HomePage() {
                   </svg>
                   Scan Network
                 </button>
-                <button
-                  type="button"
-                  className={`h-10 px-3.5 rounded-[10px] border cursor-pointer flex items-center gap-2 text-[13px] font-medium whitespace-nowrap transition-all ${
-                    webcamOn
-                      ? "border-[#f0652c] bg-[rgba(240,101,44,0.14)] text-[#f0652c]"
-                      : "border-[#272727] bg-[#1a1a1a] text-[#e8e8e8] hover:border-[#f0652c] hover:text-[#f0652c]"
-                  }`}
-                  onClick={() => setWebcamOn((on) => !on)}
-                  title={webcamOn ? "Turn off webcam" : "Use this device's webcam"}
-                  aria-pressed={webcamOn}
-                >
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M23 7l-7 5 7 5z" />
-                    <rect x="1" y="5" width="15" height="14" rx="2" />
-                  </svg>
-                  {webcamOn ? "Webcam On" : "Webcam"}
-                </button>
                 <CredentialsPanel
                   credentials={globalCredentials}
                   onChange={setGlobalCredentials}
                   onApply={handleApplyGlobalCredentials}
                 />
-                <ModelStatusBadge state={modelState} />
                 <div className="flex items-center gap-[7px] text-[12px] text-[#8a8a8a]">
                   <span
                     className="w-2 h-2 rounded-full bg-[#22c55e] shadow-[0_0_6px_#22c55e] animate-[pulse-dot_2s_infinite]"
@@ -498,11 +481,6 @@ export default function HomePage() {
             </div>
 
             <div className="flex-1 overflow-y-auto px-[22px] pb-[22px]">
-              {webcamOn ? (
-                <div className="mb-3.5">
-                  <WebcamCard onEvent={handleEvent} onClose={() => setWebcamOn(false)} />
-                </div>
-              ) : null}
               {cameraLoadError ? (
                 <div className="flex min-h-[400px] items-center justify-center rounded-[10px] border border-[#272727] bg-[#1a1a1a] text-[#ef4444] text-[13px] px-4 text-center">
                   {cameraLoadError}
@@ -515,7 +493,7 @@ export default function HomePage() {
                   onSelect={setSelectedId}
                   onStreamFailed={handleStreamFailed}
                   onCredentialsRequest={setCredentialsModalCameraId}
-                  modelsReady={modelState === "ready"}
+                  modelsReady={true}
                   onEvent={handleEvent}
                 />
               )}
@@ -529,7 +507,7 @@ export default function HomePage() {
               </svg>
               <span className="text-[15px] font-semibold text-[#e8e8e8]">Events</span>
             </div>
-            <EventsPanel events={events} live={modelState === "ready"} />
+            <EventsPanel events={events} live={true} />
           </aside>
 
           {credentialsModalCamera && credentialsModalInitial ? (
