@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { loadCameraStreamSource } from "../../cameras/serverCameraConfig";
+import { resolveRtspStreamUrl } from "@/app/api/cameras/resolveRtspStreamUrl";
 import { getBufferedSnapshot } from "@/app/services/rtspSnapshotPool";
 
 export const dynamic = "force-dynamic";
@@ -9,7 +9,7 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const cameraId = searchParams.get("cameraId") ?? "unknown";
   const streamUrl = searchParams.get("streamUrl") ?? "";
-  const rtspUrl = await resolveRtspUrl(cameraId, streamUrl, request.url);
+  const rtspUrl = await resolveRtspStreamUrl(cameraId, streamUrl, request.url);
 
   if (!rtspUrl || (!rtspUrl.startsWith("rtsp://") && !rtspUrl.startsWith("rtsps://"))) {
     return NextResponse.json({ error: "Invalid RTSP URL" }, { status: 400 });
@@ -31,22 +31,4 @@ export async function GET(request: Request) {
       Pragma: "no-cache",
     },
   });
-}
-
-async function resolveRtspUrl(
-  cameraId: string,
-  streamUrl: string,
-  requestUrl: string,
-): Promise<string | undefined> {
-  if (streamUrl.startsWith("rtsp://") || streamUrl.startsWith("rtsps://")) {
-    return streamUrl;
-  }
-
-  if (streamUrl.startsWith("/api/stream/rtsp")) {
-    const parsed = new URL(streamUrl, requestUrl);
-    return parsed.searchParams.get("url") ?? undefined;
-  }
-
-  const camera = await loadCameraStreamSource(cameraId);
-  return camera?.rtsp_url;
 }
