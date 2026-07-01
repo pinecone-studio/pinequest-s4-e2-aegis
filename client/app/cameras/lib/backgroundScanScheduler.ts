@@ -1,6 +1,14 @@
 "use client";
 
-import { GEMINI_VIOLATION_THRESHOLD, EVIDENCE_COOLDOWN_MS } from "@/lib/aiConfig";
+import {
+  EVIDENCE_COOLDOWN_MS,
+  GEMINI_VIOLATION_THRESHOLD,
+  PERSON_STICKY_MS,
+} from "@/lib/aiConfig";
+import {
+  detectMotionFromDataUrl,
+  type MotionSample,
+} from "@/lib/motionGate";
 import {
   captureEvidenceFromDataUrl,
   CIGARETTE_KIND,
@@ -8,15 +16,20 @@ import {
   VAPE_KIND,
 } from "@/lib/cameraAiUtils";
 import type { EvidenceEvent } from "@/lib/evidence";
+import {
+  buildGeminiFrameSet,
+  hasTemporalContext,
+  recordSceneFrame,
+} from "@/lib/sceneBaseline";
 import { buildCameraStreamUrl } from "./cameraApi";
 import type { CameraView } from "./cameraTypes";
-import { patchCameraScanState } from "./cameraScanStore";
+import { getCameraScanState, patchCameraScanState } from "./cameraScanStore";
 import {
   BACKGROUND_SNAPSHOT_JITTER_MS,
   BACKGROUND_SNAPSHOT_POLL_MS,
   fetchSnapshotAsBase64,
 } from "./snapshotScheduler";
-import { postGeminiAnalyze } from "./yoloApi";
+import { postGeminiAnalyzeFrames, postYoloPersonGate } from "./yoloApi";
 
 const MAX_CONCURRENT_SCANS = 2;
 const SCAN_TIMEOUT_MS = 12_000;
@@ -28,13 +41,24 @@ const VIOLATION_SPECS: {
   label: "Cigarette" | "Vape" | "Litter";
   key: ViolationKey;
   kind: typeof CIGARETTE_KIND;
+  requiresTemporal: boolean;
 }[] = [
-  { label: "Cigarette", key: "cigarette", kind: CIGARETTE_KIND },
-  { label: "Vape", key: "vape", kind: VAPE_KIND },
-  { label: "Litter", key: "litter", kind: LITTER_KIND },
+  { label: "Cigarette", key: "cigarette", kind: CIGARETTE_KIND, requiresTemporal: false },
+  { label: "Vape", key: "vape", kind: VAPE_KIND, requiresTemporal: false },
+  { label: "Litter", key: "litter", kind: LITTER_KIND, requiresTemporal: true },
 ];
 
 const lastEvidenceAt = new Map<string, number>();
+
+/** When YOLO is offline, pause person-gate attempts (not Gemini) for all cameras. */
+let yoloGatePausedUntil = 0;
+const YOLO_OFFLINE_BACKOFF_MS = 60_000;
+
+const lastNoPersonLogAt = new Map<string, number>();
+const NO_PERSON_LOG_COOLDOWN_MS = 30_000;
+
+const motionSamples = new Map<string, MotionSample>();
+const lastPersonSeenAt = new Map<string, number>();
 
 interface ScanSubscription {
   active: boolean;
@@ -149,8 +173,6 @@ async function runTask({ subscription }: ScanTask) {
   const timeout = setTimeout(() => controller.abort(), SCAN_TIMEOUT_MS);
   subscription.abortController = controller;
 
-  patchCameraScanState(cameraId, { analyzing: true });
-
   try {
     const base64Image = await fetchSnapshotAsBase64(
       cameraId,
@@ -176,22 +198,87 @@ async function runTask({ subscription }: ScanTask) {
     });
 
     if (subscription.aiReady) {
-      const result = await postGeminiAnalyze(cameraId, base64Image, controller.signal);
-      if (!subscription.active || !result) return;
+      const now = Date.now();
+      if (now < yoloGatePausedUntil) {
+        return;
+      }
 
-      const detections = Array.isArray(result.detections) ? result.detections : [];
-      const hasPerson = detections.some((d) => d.label === "Person");
-      const summary = (result.summary ?? "").trim();
+      const motion = await detectMotionFromDataUrl(
+        base64Image,
+        motionSamples.get(cameraId) ?? null,
+      );
+      if (motion) {
+        motionSamples.set(cameraId, motion.sample);
+      }
+
+      const scanState = getCameraScanState(cameraId);
+      const personRecentlySeen =
+        scanState.hasPerson ||
+        now - (lastPersonSeenAt.get(cameraId) ?? 0) < PERSON_STICKY_MS;
+
+      if (!motion?.motionDetected && !personRecentlySeen) {
+        if (scanState.hasPerson) {
+          patchCameraScanState(cameraId, { hasPerson: false, yoloImage: null });
+        }
+        return;
+      }
+
+      patchCameraScanState(cameraId, { analyzing: true });
+
+      const yolo = await postYoloPersonGate(cameraId, base64Image, controller.signal);
+      if (!subscription.active) return;
+
+      if (!yolo) {
+        yoloGatePausedUntil = now + YOLO_OFFLINE_BACKOFF_MS;
+        console.warn(
+          `[yolo:${cameraId}] person gate offline — pausing YOLO checks for ${YOLO_OFFLINE_BACKOFF_MS / 1000}s (Gemini not called). Start models: cd models && python server.py`,
+        );
+        return;
+      }
+
+      yoloGatePausedUntil = 0;
+
+      const hasPerson = yolo.has_person === true;
+      if (hasPerson) {
+        lastPersonSeenAt.set(cameraId, now);
+      } else {
+        lastPersonSeenAt.delete(cameraId);
+      }
 
       patchCameraScanState(cameraId, {
         hasPerson,
-        yoloImage: hasPerson ? base64Image : null,
+        yoloImage: hasPerson ? (yolo.image ?? base64Image) : null,
+        lastViolation: null,
       });
 
-      const now = Date.now();
+      if (!hasPerson) {
+        recordSceneFrame(cameraId, base64Image, false);
+        const lastLog = lastNoPersonLogAt.get(cameraId) ?? 0;
+        if (now - lastLog >= NO_PERSON_LOG_COOLDOWN_MS) {
+          lastNoPersonLogAt.set(cameraId, now);
+          console.log(`[yolo:${cameraId}] no person — skipping Gemini`);
+        }
+        return;
+      }
+
+      recordSceneFrame(cameraId, base64Image, true);
+      const geminiFrames = buildGeminiFrameSet(cameraId, base64Image);
+      const temporalOk = hasTemporalContext(cameraId, base64Image);
+
+      console.log(
+        `[yolo:${cameraId}] person detected — calling Gemini (${geminiFrames.length} frame${geminiFrames.length === 1 ? "" : "s"})`,
+      );
+      const result = await postGeminiAnalyzeFrames(cameraId, geminiFrames, controller.signal);
+      if (!subscription.active || !result) return;
+
+      const detections = Array.isArray(result.detections) ? result.detections : [];
+      const summary = (result.summary ?? "").trim();
+
       let topViolation: { label: string; confidence: number } | null = null;
 
       for (const spec of VIOLATION_SPECS) {
+        if (spec.requiresTemporal && !temporalOk) continue;
+
         const det = detections
           .filter((d) => d.label === spec.label && d.confidence >= GEMINI_VIOLATION_THRESHOLD)
           .sort((a, b) => b.confidence - a.confidence)[0];

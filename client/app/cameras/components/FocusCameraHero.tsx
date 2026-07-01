@@ -22,6 +22,15 @@ import {
   VAPE_KIND,
 } from "@/lib/cameraAiUtils";
 import {
+  buildGeminiFrameSet,
+  hasTemporalContext,
+  recordSceneFrame,
+} from "@/lib/sceneBaseline";
+import {
+  postGeminiAnalyzeFrames,
+  postYoloPersonGate,
+} from "../lib/yoloApi";
+import {
   isLiveStreamUrl,
   SELECTED_AI_INTERVAL_MS,
   SELECTED_GEMINI_BACKOFF_MS,
@@ -38,10 +47,6 @@ const VIOLATION_COLORS: Record<ViolationLabel, string> = {
   Vape: "#a855f7",
   Litter: "#f97316",
 };
-
-function detectEndpoint(cameraId: string): string {
-  return `/api/gemini/${encodeURIComponent(cameraId)}`;
-}
 
 function formatClock(date: Date): string {
   return date.toLocaleTimeString("en-US", {
@@ -128,9 +133,8 @@ export default function FocusCameraHero({
     setAnalyzing(true);
     setStatusLine("Analyzing live frames…");
 
-    try {
-      const now = Date.now();
-      const history = frameHistoryRef.current.filter((f) => now - f.at < FRAME_HISTORY_MS);
+    const now = Date.now();
+    const history = frameHistoryRef.current.filter((f) => now - f.at < FRAME_HISTORY_MS);
       let images =
         history.length >= 2
           ? [history[history.length - 2].dataUrl, history[history.length - 1].dataUrl]
@@ -159,77 +163,84 @@ export default function FocusCameraHero({
         GEMINI_FETCH_TIMEOUT_MS,
       );
 
-      let data: { detections?: Detection[]; summary?: string };
       try {
-        const res = await fetch(detectEndpoint(camera.id), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ images }),
-          signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
-        data = (await res.json()) as { detections?: Detection[]; summary?: string };
+        const gateImage = images[images.length - 1];
+        const yolo = await postYoloPersonGate(camera.id, gateImage, controller.signal);
+        if (!yolo?.has_person) {
+          recordSceneFrame(camera.id, gateImage, false);
+          setStatusLine(yolo ? "No person in frame — AI idle" : "Person gate offline — retrying…");
+          return;
+        }
+
+        recordSceneFrame(camera.id, gateImage, true);
+        const geminiFrames = buildGeminiFrameSet(camera.id, gateImage);
+        const temporalOk = hasTemporalContext(camera.id, gateImage);
+        const framesForGemini =
+          geminiFrames.length >= 2 ? geminiFrames : images.length >= 2 ? images : geminiFrames;
+
+        const result = await postGeminiAnalyzeFrames(camera.id, framesForGemini, controller.signal);
+        if (!result) throw new Error("Gemini HTTP error");
+        const data = result;
+
+        const raw = Array.isArray(data.detections) ? data.detections : [];
+        const dets = raw.filter(
+          (d) => d.label === "Person" || d.confidence >= GEMINI_VIOLATION_THRESHOLD,
+        );
+        const summary = (data.summary ?? "").trim();
+        const liveImg = imgRef.current;
+        if (!liveImg) return;
+
+        const ts = Date.now();
+        const best = (detLabel: string) =>
+          dets
+            .filter((d) => d.label === detLabel)
+            .sort((a, b) => b.confidence - a.confidence)[0];
+
+        const violations: {
+          det: Detection | undefined;
+          kind: typeof CIGARETTE_KIND;
+          key: "cigarette" | "vape" | "litter";
+          label: ViolationLabel;
+        }[] = [
+          { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette", label: "Cigarette" },
+          { det: best("Vape"), kind: VAPE_KIND, key: "vape", label: "Vape" },
+          { det: best("Litter"), kind: LITTER_KIND, key: "litter", label: "Litter" },
+        ];
+
+        let triggered = false;
+        for (const { det, kind, key, label: violationLabel } of violations) {
+          if (!det) continue;
+          if (key === "litter" && !temporalOk && framesForGemini.length < 2) continue;
+          triggered = true;
+          flashAlert(violationLabel, det.confidence, summary || `${violationLabel} detected`);
+          if (ts - lastCaptureRef.current[key] >= EVIDENCE_COOLDOWN_MS) {
+            lastCaptureRef.current[key] = ts;
+            void captureEvidenceFromSource(
+              liveImg,
+              camera.id,
+              label,
+              kind,
+              det.confidence,
+              onEventRef.current,
+              summary || undefined,
+            );
+          }
+        }
+
+        if (!triggered) {
+          setStatusLine(summary || "Monitoring — no violations detected");
+        }
+      } catch (err) {
+        const isAbort = err instanceof DOMException && err.name === "AbortError";
+        if (!isAbort) {
+          console.warn(`[focus-ai:${camera.id}]`, err);
+          setStatusLine("Analysis paused — retrying…");
+        }
       } finally {
         window.clearTimeout(fetchTimeout);
+        verifyInFlightRef.current = false;
+        setAnalyzing(false);
       }
-
-      const raw = Array.isArray(data.detections) ? data.detections : [];
-      const dets = raw.filter(
-        (d) => d.label === "Person" || d.confidence >= GEMINI_VIOLATION_THRESHOLD,
-      );
-      const summary = (data.summary ?? "").trim();
-      const liveImg = imgRef.current;
-      if (!liveImg) return;
-
-      const ts = Date.now();
-      const best = (detLabel: string) =>
-        dets
-          .filter((d) => d.label === detLabel)
-          .sort((a, b) => b.confidence - a.confidence)[0];
-
-      const violations: {
-        det: Detection | undefined;
-        kind: typeof CIGARETTE_KIND;
-        key: "cigarette" | "vape" | "litter";
-        label: ViolationLabel;
-      }[] = [
-        { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette", label: "Cigarette" },
-        { det: best("Vape"), kind: VAPE_KIND, key: "vape", label: "Vape" },
-        { det: best("Litter"), kind: LITTER_KIND, key: "litter", label: "Litter" },
-      ];
-
-      let triggered = false;
-      for (const { det, kind, key, label: violationLabel } of violations) {
-        if (!det) continue;
-        triggered = true;
-        flashAlert(violationLabel, det.confidence, summary || `${violationLabel} detected`);
-        if (ts - lastCaptureRef.current[key] >= EVIDENCE_COOLDOWN_MS) {
-          lastCaptureRef.current[key] = ts;
-          void captureEvidenceFromSource(
-            liveImg,
-            camera.id,
-            label,
-            kind,
-            det.confidence,
-            onEventRef.current,
-            summary || undefined,
-          );
-        }
-      }
-
-      if (!triggered) {
-        setStatusLine(summary || "Monitoring — no violations detected");
-      }
-    } catch (err) {
-      const isAbort = err instanceof DOMException && err.name === "AbortError";
-      if (!isAbort) {
-        console.warn(`[focus-ai:${camera.id}]`, err);
-        setStatusLine("Analysis paused — retrying…");
-      }
-    } finally {
-      verifyInFlightRef.current = false;
-      setAnalyzing(false);
-    }
   }, [aiActive, camera.id, flashAlert, label]);
 
   const sampleFrame = useCallback(() => {
@@ -282,7 +293,7 @@ export default function FocusCameraHero({
           : "border-[#272727] shadow-[0_8px_32px_rgba(0,0,0,0.45)]"
       }`}
     >
-      <div className="relative aspect-[21/9] max-h-[min(42vh,420px)] w-full min-h-[220px] bg-[#0a0a0a]">
+      <div className="relative aspect-video max-h-[min(72vh,720px)] w-full min-h-[360px] bg-[#0a0a0a]">
         {canStream ? (
           <img
             key={`${camera.id}-hero`}

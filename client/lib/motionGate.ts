@@ -63,3 +63,25 @@ export function detectMotion(
     sample,
   };
 }
+
+function loadImageFromDataUrl(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("failed to load frame"));
+    img.src = dataUrl;
+  });
+}
+
+/** Motion check from a snapshot data URL (background grid scans). */
+export async function detectMotionFromDataUrl(
+  dataUrl: string,
+  previous: MotionSample | null,
+): Promise<MotionResult | null> {
+  try {
+    const img = await loadImageFromDataUrl(dataUrl);
+    return detectMotion(img, previous);
+  } catch {
+    return null;
+  }
+}

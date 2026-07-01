@@ -19,11 +19,33 @@ export async function POST(request: NextRequest, context: RouteContext) {
 
     // 2. Локал Python LitServe рүү илгээж хүн байгааг шалгуулах
     const yoloUrl = process.env.YOLO_API_URL || "http://localhost:8000/predict";
-    const yoloResponse = await fetch(yoloUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: base64Image }),
-    });
+    let yoloResponse: Response;
+    try {
+      yoloResponse = await fetch(yoloUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image: base64Image }),
+      });
+    } catch (error: unknown) {
+      const refused =
+        error instanceof TypeError &&
+        error.cause instanceof AggregateError &&
+        error.cause.errors.some(
+          (e: unknown) => e instanceof Error && "code" in e && e.code === "ECONNREFUSED",
+        );
+      console.error(
+        `❌ [yolo:${cameraId}] Models service unreachable at ${yoloUrl} — start: cd models && python server.py`,
+      );
+      return NextResponse.json(
+        {
+          success: false,
+          error: refused
+            ? "YOLO models service offline (ECONNREFUSED)"
+            : "YOLO models service unreachable",
+        },
+        { status: 503 },
+      );
+    }
 
     if (!yoloResponse.ok) {
       console.error(`❌ [yolo:${cameraId}] Filter server failed or offline.`);
@@ -53,7 +75,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
-    console.error("❌ API Error:", error);
+    console.error(`❌ [yolo:${(await context.params).cameraId}]`, error);
     return NextResponse.json({ success: false, error: message }, { status: 500 });
   }
 }

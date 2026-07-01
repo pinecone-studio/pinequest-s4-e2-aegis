@@ -7,9 +7,14 @@
 
 const BACKEND_URL = process.env.BACKEND_URL ?? "http://localhost:3001";
 
-export async function forwardToBackend(request: Request): Promise<Response> {
+export async function forwardToBackend(
+  request: Request,
+  backendPathOrContext?: string | unknown,
+): Promise<Response> {
   const incoming = new URL(request.url);
-  const target = `${BACKEND_URL}${incoming.pathname}${incoming.search}`;
+  const path =
+    typeof backendPathOrContext === "string" ? backendPathOrContext : incoming.pathname;
+  const target = `${BACKEND_URL}${path}${incoming.search}`;
 
   const method = request.method.toUpperCase();
   const hasBody = method !== "GET" && method !== "HEAD";

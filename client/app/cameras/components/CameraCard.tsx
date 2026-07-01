@@ -270,7 +270,7 @@ export default function CameraCard({
                 scan.hasPerson ? "bg-[#22c55e]" : "bg-[#f0652c]"
               } ${analyzing ? "animate-[pulse-dot_0.8s_ease-in-out_infinite]" : ""}`}
             />
-            {analyzing ? "Analyzing" : scan.hasPerson ? "Person" : "AI"}
+            {analyzing ? "Analyzing" : scan.hasPerson ? "Person" : "Idle"}
           </span>
         </div>
       ) : null}

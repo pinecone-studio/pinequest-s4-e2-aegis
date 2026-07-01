@@ -8,7 +8,7 @@ const ENDPOINT = (model: string, key: string) =>
 const PROMPT = `You are a surveillance vision system that monitors for SMOKING and LITTERING. Look at this single frame and report:
 - "Cigarette": a cigarette held in a hand or at the mouth, lit or unlit.
 - "Vape": an e-cigarette / vape pen / pod held near the mouth or hand.
-- "Litter": a bottle, can, cup, wrapper, bag, or plastic item being held about to be dropped, mid-drop, or already lying discarded.
+- "Litter": ONLY when a person is visibly holding an object they are about to drop, or an object is clearly mid-fall from a person's hand. Do NOT report trash, bottles, or debris already sitting on the ground with no discard action visible — that is pre-existing debris, not littering.
 - "Person": each visible person (secondary — context only).
 
 Be conservative: only report a Cigarette/Vape/Litter when you can CLEARLY see it. When in doubt, do NOT report it. Only assign confidence above 0.7 when you are genuinely confident.
@@ -18,12 +18,12 @@ Respond with STRICT JSON of this exact shape, no markdown:
 
 If nothing notable is present, return {"summary":"...","detections":[]}.`;
 
-const PROMPT_TEMPORAL = `You are a surveillance vision system monitoring for SMOKING and LITTERING. You are given SEVERAL frames from the SAME fixed camera, in time order (oldest first). Use the SEQUENCE to judge actions over time.
+const PROMPT_TEMPORAL = `You are a surveillance vision system monitoring for SMOKING and LITTERING. You are given SEVERAL frames from the SAME fixed camera, in time order (oldest first). The earliest frame(s) may be an empty or pre-person scene baseline. Use the SEQUENCE to judge actions over time.
 
 Report:
 - "Cigarette": a cigarette held in a hand or at the mouth, lit or unlit.
 - "Vape": an e-cigarette / vape pen / pod held near the mouth or hand.
-- "Litter": LITTERING AS AN ACTION — a person carries an object and then DROPS or DISCARDS it. Someone simply carrying a bottle with no drop is NOT littering.
+- "Litter": LITTERING AS AN ACTION ONLY — a person carries an object and then DROPS or DISCARDS it, or a NEW object appears on the ground during the sequence that was NOT present in earlier frames. Someone walking past debris that was already on the floor in the first frame is NOT littering. Trash unchanged on the ground from start to finish is pre-existing debris — do NOT report Litter.
 - "Person": each visible person (secondary — context only).
 
 Be conservative. When in doubt, do NOT report it.
