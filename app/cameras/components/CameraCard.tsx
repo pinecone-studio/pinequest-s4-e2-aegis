@@ -47,6 +47,7 @@ export default function CameraCard({
   aiReady = false,
   aiActive = false,
   onEvent,
+  onSnapshotPreview,
 }: {
   camera: CameraView;
   label: string;
@@ -58,6 +59,7 @@ export default function CameraCard({
   aiReady?: boolean;
   aiActive?: boolean;
   onEvent?: (event: EvidenceEvent) => void;
+  onSnapshotPreview?: (previewUrl: string | null) => void;
 }) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
@@ -65,6 +67,7 @@ export default function CameraCard({
   const containerRef = useRef<HTMLElement>(null);
   const onEventRef = useRef(onEvent);
   const onStreamSettledRef = useRef(onStreamSettled);
+  const onSnapshotPreviewRef = useRef(onSnapshotPreview);
   const snapshotUrlRef = useRef<string | null>(null);
   const lastCaptureRef = useRef({ cigarette: 0, vape: 0, litter: 0 });
 
@@ -97,6 +100,10 @@ export default function CameraCard({
   }, [onStreamSettled]);
 
   useEffect(() => {
+    onSnapshotPreviewRef.current = onSnapshotPreview;
+  }, [onSnapshotPreview]);
+
+  useEffect(() => {
     setImageLoaded(false);
     setSnapshotUrl(null);
     if (snapshotUrlRef.current) {
@@ -104,6 +111,7 @@ export default function CameraCard({
       snapshotUrlRef.current = null;
     }
     lastCaptureRef.current = { cigarette: 0, vape: 0, litter: 0 };
+    onSnapshotPreviewRef.current?.(null);
   }, [camera.id, camera.stream_url, camera.enabled]);
 
   useEffect(() => {
@@ -119,6 +127,7 @@ export default function CameraCard({
         setSnapshotUrl(nextUrl);
         setImageLoaded(true);
         onStreamSettledRef.current("online");
+        onSnapshotPreviewRef.current?.(nextUrl);
         if (previousUrl) {
           URL.revokeObjectURL(previousUrl);
         }

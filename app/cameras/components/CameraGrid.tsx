@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import CameraCard from "./CameraCard";
+import CameraExpandDialog from "./CameraExpandDialog";
 import type { CameraView } from "../lib/cameraTypes";
 import type { EvidenceEvent } from "@/lib/evidence";
 
@@ -28,13 +29,16 @@ export default function CameraGrid({
   cameras: CameraView[];
   columns?: number;
   selectedId?: string | null;
-  onSelect?: (id: string) => void;
+  onSelect?: (id: string | null) => void;
   onStreamFailed?: (cameraId: string) => void;
   onCredentialsRequest?: (cameraId: string) => void;
   aiReady?: boolean;
   onEvent?: (event: EvidenceEvent) => void;
 }) {
   const [renderCount, setRenderCount] = useState(CAMERA_RENDER_CHUNK_SIZE);
+  const [expandedCameraId, setExpandedCameraId] = useState<string | null>(null);
+  const [expandedPreviewUrl, setExpandedPreviewUrl] = useState<string | null>(null);
+  const snapshotPreviewRef = useRef<Record<string, string>>({});
   const cappedCameras = useMemo(
     () => cameras.slice(0, MAX_RENDERED_CAMERAS),
     [cameras],
@@ -150,6 +154,37 @@ export default function CameraGrid({
     return ids;
   }, [renderCameras, selectedId]);
 
+  const expandedCamera = useMemo(
+    () =>
+      expandedCameraId
+        ? cameras.find((camera) => camera.id === expandedCameraId) ?? null
+        : null,
+    [cameras, expandedCameraId],
+  );
+
+  const handleExpandCamera = (cameraId: string) => {
+    setExpandedCameraId(cameraId);
+    setExpandedPreviewUrl(snapshotPreviewRef.current[cameraId] ?? null);
+    onSelect?.(cameraId);
+  };
+
+  const handleCloseExpanded = () => {
+    setExpandedCameraId(null);
+    setExpandedPreviewUrl(null);
+    onSelect?.(null);
+  };
+
+  const handleSnapshotPreview = (cameraId: string, previewUrl: string | null) => {
+    if (previewUrl) {
+      snapshotPreviewRef.current[cameraId] = previewUrl;
+      if (expandedCameraId === cameraId) {
+        setExpandedPreviewUrl(previewUrl);
+      }
+      return;
+    }
+    delete snapshotPreviewRef.current[cameraId];
+  };
+
   if (cappedCameras.length === 0) {
     return (
       <div className="flex aspect-video items-center justify-center rounded-[10px] border border-[#272727] bg-[#1a1a1a] text-[#8a8a8a] text-[13px]">
@@ -160,6 +195,13 @@ export default function CameraGrid({
 
   return (
     <>
+      {expandedCamera ? (
+        <CameraExpandDialog
+          camera={expandedCamera}
+          initialPreviewUrl={expandedPreviewUrl}
+          onClose={handleCloseExpanded}
+        />
+      ) : null}
       {cameras.length > MAX_RENDERED_CAMERAS ? (
         <div className="mb-3 rounded-[10px] border border-[#272727] bg-[#1a1a1a] px-3 py-2 text-[12px] text-[#8a8a8a]">
           Showing first {MAX_RENDERED_CAMERAS} of {cameras.length} cameras.
@@ -174,8 +216,8 @@ export default function CameraGrid({
             key={camera.id}
             camera={camera}
             label={cameraLabel(camera, index)}
-            selected={selectedId === camera.id}
-            onSelect={onSelect ? () => onSelect(camera.id) : undefined}
+            selected={expandedCameraId === camera.id}
+            onSelect={onSelect ? () => handleExpandCamera(camera.id) : undefined}
             streamState={streamStates[camera.id] ?? "not_started"}
             onStreamSettled={(state) => {
               setStreamStates((current) => {
@@ -191,6 +233,7 @@ export default function CameraGrid({
             }
             aiReady={aiReady}
             aiActive={aiCameraIds.has(camera.id)}
+            onSnapshotPreview={(previewUrl) => handleSnapshotPreview(camera.id, previewUrl)}
             onEvent={onEvent}
           />
         ))}

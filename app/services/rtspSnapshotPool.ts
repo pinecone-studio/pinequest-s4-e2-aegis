@@ -2,15 +2,26 @@ import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import {
   applyPasswordToRtspUrl,
   buildPasswordCandidates,
+  canonicalRtspSourceKey,
 } from "@/lib/rtspPasswordFallback";
 
 const FFMPEG_BIN = process.env.FFMPEG_PATH || "ffmpeg";
 const IDLE_EVICT_MS = 60_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
-const INITIAL_CONNECT_TIMEOUT_MS = 12_000;
+const INITIAL_CONNECT_TIMEOUT_MS = 20_000;
 const MAX_BACKOFF_MS = 30_000;
+const SNAPSHOT_FPS = 1;
+const MJPEG_FPS = 12;
+const MJPEG_FPS_UPGRADE_DELAY_MS = 2_500;
+const AUTH_RETRY_COOLDOWN_MS = 8_000;
 
 export type SnapshotErrorKind = "auth" | "connection" | "timeout" | "unavailable";
+
+interface MjpegSubscriber {
+  id: number;
+  onFrame: (jpeg: Uint8Array) => void;
+  onError?: (error: SnapshotErrorKind) => void;
+}
 
 interface FrameWaiter {
   id: number;
@@ -23,22 +34,29 @@ interface FrameWaiter {
 
 interface PoolEntry {
   cameraId: string;
+  canonicalKey: string;
   sourceRtspUrl: string;
   rtspUrl: string;
   passwordCandidates: string[];
   passwordCandidateIndex: number;
+  currentFps: number;
   process: ChildProcessWithoutNullStreams | null;
+  processGeneration: number;
   latestJpeg: Uint8Array | null;
   errorKind: SnapshotErrorKind | null;
+  authExhaustedAt: number | null;
   consecutiveFailures: number;
   lastRequestAt: number;
   backoffMs: number;
   stdoutBuffer: Buffer;
   frameWaiters: FrameWaiter[];
+  mjpegSubscribers: Map<number, MjpegSubscriber>;
   idleTimer: ReturnType<typeof setTimeout> | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
+  fpsUpgradeTimer: ReturnType<typeof setTimeout> | null;
   starting: boolean;
   nextWaiterId: number;
+  nextMjpegSubscriberId: number;
 }
 
 const pool = new Map<string, PoolEntry>();
@@ -51,8 +69,31 @@ export async function getBufferedSnapshot(
   const entry = ensureEntry(cameraId, rtspUrl);
   touchEntry(entry);
 
-  if (entry.errorKind === "auth" && entry.passwordCandidateIndex + 1 >= entry.passwordCandidates.length) {
+  if (
+    entry.errorKind === "auth" &&
+    entry.authExhaustedAt &&
+    Date.now() - entry.authExhaustedAt < AUTH_RETRY_COOLDOWN_MS
+  ) {
     return { error: "auth" };
+  }
+
+  if (entry.errorKind === "auth" && entry.authExhaustedAt) {
+    entry.passwordCandidateIndex = 0;
+    entry.rtspUrl = applyPasswordToRtspUrl(
+      entry.sourceRtspUrl,
+      entry.passwordCandidates[0] ?? "",
+    );
+    clearAuthFailure(entry);
+    if (!entry.process && !entry.starting) {
+      startFfmpeg(entry);
+    }
+  } else if (entry.errorKind === "auth") {
+    if (entry.passwordCandidateIndex + 1 < entry.passwordCandidates.length) {
+      clearAuthFailure(entry);
+      if (!entry.process && !entry.starting) {
+        startFfmpeg(entry);
+      }
+    }
   }
 
   if (entry.latestJpeg) {
@@ -82,35 +123,90 @@ export async function getBufferedSnapshot(
   }
 }
 
+export function subscribeMjpegStream(
+  cameraId: string,
+  rtspUrl: string,
+  callbacks: {
+    onFrame: (jpeg: Uint8Array) => void;
+    onError?: (error: SnapshotErrorKind) => void;
+  },
+  signal?: AbortSignal,
+): () => void {
+  const entry = ensureEntry(cameraId, rtspUrl);
+  touchEntry(entry);
+
+  const subscriberId = entry.nextMjpegSubscriberId;
+  entry.nextMjpegSubscriberId += 1;
+
+  entry.mjpegSubscribers.set(subscriberId, {
+    id: subscriberId,
+    onFrame: callbacks.onFrame,
+    onError: callbacks.onError,
+  });
+
+  adjustFpsIfNeeded(entry);
+
+  if (!entry.process && !entry.starting) {
+    startFfmpeg(entry);
+  }
+
+  if (entry.latestJpeg) {
+    callbacks.onFrame(entry.latestJpeg);
+  }
+
+  const unsubscribe = () => {
+    entry.mjpegSubscribers.delete(subscriberId);
+    adjustFpsIfNeeded(entry);
+    if (entry.mjpegSubscribers.size === 0) {
+      touchEntry(entry);
+    }
+  };
+
+  signal?.addEventListener("abort", unsubscribe, { once: true });
+  return unsubscribe;
+}
+
 export function evictSnapshotCamera(cameraId: string) {
   const entry = pool.get(cameraId);
   if (!entry) return;
+  notifyMjpegError(entry, entry.errorKind ?? "unavailable");
+  entry.mjpegSubscribers.clear();
   stopEntry(entry);
   pool.delete(cameraId);
 }
 
 function ensureEntry(cameraId: string, rtspUrl: string): PoolEntry {
+  const canonicalKey = canonicalRtspSourceKey(rtspUrl);
   let entry = pool.get(cameraId);
+
   if (!entry) {
-    entry = createEntry(cameraId, rtspUrl);
+    entry = createEntry(cameraId, rtspUrl, canonicalKey);
     pool.set(cameraId, entry);
     return entry;
   }
 
-  if (entry.rtspUrl !== rtspUrl && entry.sourceRtspUrl !== rtspUrl) {
+  if (entry.canonicalKey !== canonicalKey) {
     stopEntry(entry);
-    configureEntryUrls(entry, rtspUrl);
+    configureEntryUrls(entry, rtspUrl, canonicalKey);
+    entry.passwordCandidateIndex = 0;
     entry.latestJpeg = null;
-    entry.errorKind = null;
+    clearAuthFailure(entry);
     entry.consecutiveFailures = 0;
     entry.backoffMs = 1000;
+    return entry;
+  }
+
+  if (entry.sourceRtspUrl !== rtspUrl) {
+    entry.sourceRtspUrl = rtspUrl;
+    mergePasswordCandidates(entry, rtspUrl);
   }
 
   return entry;
 }
 
-function configureEntryUrls(entry: PoolEntry, rtspUrl: string) {
+function configureEntryUrls(entry: PoolEntry, rtspUrl: string, canonicalKey: string) {
   entry.sourceRtspUrl = rtspUrl;
+  entry.canonicalKey = canonicalKey;
   entry.passwordCandidates = buildPasswordCandidates(rtspUrl);
   entry.passwordCandidateIndex = 0;
   entry.rtspUrl = applyPasswordToRtspUrl(
@@ -119,28 +215,105 @@ function configureEntryUrls(entry: PoolEntry, rtspUrl: string) {
   );
 }
 
-function createEntry(cameraId: string, rtspUrl: string): PoolEntry {
+function mergePasswordCandidates(entry: PoolEntry, rtspUrl: string) {
+  const incoming = buildPasswordCandidates(rtspUrl);
+  for (const password of incoming) {
+    if (!entry.passwordCandidates.includes(password)) {
+      entry.passwordCandidates.push(password);
+    }
+  }
+}
+
+function createEntry(cameraId: string, rtspUrl: string, canonicalKey: string): PoolEntry {
   const entry: PoolEntry = {
     cameraId,
+    canonicalKey,
     sourceRtspUrl: rtspUrl,
     rtspUrl,
     passwordCandidates: [],
     passwordCandidateIndex: 0,
+    currentFps: SNAPSHOT_FPS,
     process: null,
+    processGeneration: 0,
     latestJpeg: null,
     errorKind: null,
+    authExhaustedAt: null,
     consecutiveFailures: 0,
     lastRequestAt: Date.now(),
     backoffMs: 1000,
     stdoutBuffer: Buffer.alloc(0),
     frameWaiters: [],
+    mjpegSubscribers: new Map(),
     idleTimer: null,
     reconnectTimer: null,
+    fpsUpgradeTimer: null,
     starting: false,
     nextWaiterId: 1,
+    nextMjpegSubscriberId: 1,
   };
-  configureEntryUrls(entry, rtspUrl);
+  configureEntryUrls(entry, rtspUrl, canonicalKey);
+  entry.currentFps = desiredFps(entry);
   return entry;
+}
+
+function desiredFps(entry: PoolEntry): number {
+  return entry.mjpegSubscribers.size > 0 ? MJPEG_FPS : SNAPSHOT_FPS;
+}
+
+function cancelFpsUpgrade(entry: PoolEntry) {
+  if (!entry.fpsUpgradeTimer) return;
+  clearTimeout(entry.fpsUpgradeTimer);
+  entry.fpsUpgradeTimer = null;
+}
+
+function restartFfmpegAtCurrentFps(entry: PoolEntry) {
+  if (!entry.process && !entry.starting) return;
+  const generation = entry.processGeneration;
+  killFfmpegProcess(entry, generation);
+  entry.stdoutBuffer = Buffer.alloc(0);
+  startFfmpeg(entry);
+}
+
+function adjustFpsIfNeeded(entry: PoolEntry) {
+  const nextFps = desiredFps(entry);
+  if (entry.currentFps === nextFps) {
+    cancelFpsUpgrade(entry);
+    return;
+  }
+
+  if (nextFps < entry.currentFps) {
+    cancelFpsUpgrade(entry);
+    entry.currentFps = nextFps;
+    restartFfmpegAtCurrentFps(entry);
+    return;
+  }
+
+  if (entry.fpsUpgradeTimer) {
+    return;
+  }
+
+  // Reuse the warm decoder briefly instead of killing it on dialog open.
+  if (entry.process && entry.latestJpeg) {
+    cancelFpsUpgrade(entry);
+    entry.fpsUpgradeTimer = setTimeout(() => {
+      entry.fpsUpgradeTimer = null;
+      if (entry.mjpegSubscribers.size === 0) return;
+      if (entry.currentFps >= MJPEG_FPS) return;
+      entry.currentFps = MJPEG_FPS;
+      restartFfmpegAtCurrentFps(entry);
+    }, MJPEG_FPS_UPGRADE_DELAY_MS);
+    entry.fpsUpgradeTimer.unref?.();
+    return;
+  }
+
+  entry.currentFps = nextFps;
+  restartFfmpegAtCurrentFps(entry);
+}
+
+function clearAuthFailure(entry: PoolEntry) {
+  entry.errorKind = null;
+  entry.authExhaustedAt = null;
+  entry.consecutiveFailures = 0;
 }
 
 function touchEntry(entry: PoolEntry) {
@@ -149,6 +322,10 @@ function touchEntry(entry: PoolEntry) {
     clearTimeout(entry.idleTimer);
   }
   entry.idleTimer = setTimeout(() => {
+    if (entry.mjpegSubscribers.size > 0) {
+      touchEntry(entry);
+      return;
+    }
     if (Date.now() - entry.lastRequestAt >= IDLE_EVICT_MS) {
       evictSnapshotCamera(entry.cameraId);
     }
@@ -162,6 +339,8 @@ function startFfmpeg(entry: PoolEntry) {
   entry.starting = true;
   entry.errorKind = null;
   entry.stdoutBuffer = Buffer.alloc(0);
+  entry.processGeneration += 1;
+  const generation = entry.processGeneration;
 
   const process = spawn(
     FFMPEG_BIN,
@@ -177,7 +356,7 @@ function startFfmpeg(entry: PoolEntry) {
       entry.rtspUrl,
       "-an",
       "-vf",
-      "fps=1",
+      `fps=${entry.currentFps}`,
       "-f",
       "image2pipe",
       "-vcodec",
@@ -194,21 +373,24 @@ function startFfmpeg(entry: PoolEntry) {
   entry.starting = false;
 
   process.stdout.on("data", (chunk: Buffer) => {
+    if (generation !== entry.processGeneration) return;
     entry.stdoutBuffer = Buffer.concat([entry.stdoutBuffer, chunk]);
     extractJpegFrames(entry);
   });
 
   process.stderr.on("data", (chunk: Buffer) => {
+    if (generation !== entry.processGeneration) return;
     const text = chunk.toString("utf-8");
     for (const line of text.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       console.info(`[snapshot-pool:${entry.cameraId}] ${trimmed}`);
-      classifyStderr(entry, trimmed);
+      classifyStderr(entry, trimmed, generation);
     }
   });
 
   process.on("close", (code) => {
+    if (generation !== entry.processGeneration) return;
     entry.process = null;
     entry.starting = false;
     if (code !== 0 && code !== null) {
@@ -217,55 +399,80 @@ function startFfmpeg(entry: PoolEntry) {
         entry.errorKind = "connection";
       }
       failWaiters(entry);
+      notifyMjpegError(entry, entry.errorKind ?? "connection");
       scheduleReconnect(entry);
     }
   });
 
   process.on("error", (error) => {
+    if (generation !== entry.processGeneration) return;
     console.info(`[snapshot-pool:${entry.cameraId}] process error ${error.message}`);
     entry.errorKind = "connection";
     entry.consecutiveFailures += 1;
     failWaiters(entry);
+    notifyMjpegError(entry, "connection");
   });
 }
 
-function classifyStderr(entry: PoolEntry, line: string) {
-  if (/401|403|Unauthorized|authorization failed/i.test(line)) {
-    if (tryNextPasswordCandidate(entry)) {
-      return;
+function isAuthError(line: string): boolean {
+  return /401|403|Unauthorized|authorization failed|authentication error|method DESCRIBE failed/i.test(
+    line,
+  );
+}
+
+function classifyStderr(entry: PoolEntry, line: string, generation: number) {
+  if (!isAuthError(line)) {
+    if (/timed out|Timeout|Connection refused|No route to host|Could not find codec/i.test(line)) {
+      entry.errorKind = entry.errorKind ?? "connection";
     }
-    entry.errorKind = "auth";
-    entry.consecutiveFailures = MAX_CONSECUTIVE_FAILURES;
-    stopEntry(entry);
-    failWaiters(entry);
     return;
   }
 
-  if (/timed out|Timeout|Connection refused|No route to host|Could not find codec/i.test(line)) {
-    entry.errorKind = entry.errorKind ?? "connection";
+  if (generation !== entry.processGeneration) return;
+
+  if (tryNextPasswordCandidate(entry, generation)) {
+    return;
   }
+
+  entry.errorKind = "auth";
+  entry.authExhaustedAt = Date.now();
+  entry.consecutiveFailures = MAX_CONSECUTIVE_FAILURES;
+  stopEntry(entry);
+  failWaiters(entry);
+  notifyMjpegError(entry, "auth");
 }
 
-function tryNextPasswordCandidate(entry: PoolEntry): boolean {
+function tryNextPasswordCandidate(entry: PoolEntry, generation: number): boolean {
   if (entry.passwordCandidateIndex + 1 >= entry.passwordCandidates.length) {
     return false;
   }
 
-  killFfmpegProcess(entry);
+  killFfmpegProcess(entry, generation);
   entry.passwordCandidateIndex += 1;
   entry.rtspUrl = applyPasswordToRtspUrl(
     entry.sourceRtspUrl,
     entry.passwordCandidates[entry.passwordCandidateIndex] ?? "",
   );
-  entry.errorKind = null;
-  entry.consecutiveFailures = 0;
+  clearAuthFailure(entry);
   entry.latestJpeg = null;
   entry.backoffMs = 1000;
+  extendWaiterTimeouts(entry);
   startFfmpeg(entry);
   return true;
 }
 
-function killFfmpegProcess(entry: PoolEntry) {
+function extendWaiterTimeouts(entry: PoolEntry) {
+  for (const waiter of entry.frameWaiters) {
+    clearTimeout(waiter.timeout);
+    waiter.timeout = setTimeout(() => {
+      entry.errorKind = entry.errorKind ?? "timeout";
+      waiter.reject(new Error("snapshot timeout"));
+    }, INITIAL_CONNECT_TIMEOUT_MS);
+    waiter.timeout.unref?.();
+  }
+}
+
+function killFfmpegProcess(entry: PoolEntry, expectedGeneration: number) {
   if (entry.reconnectTimer) {
     clearTimeout(entry.reconnectTimer);
     entry.reconnectTimer = null;
@@ -274,7 +481,10 @@ function killFfmpegProcess(entry: PoolEntry) {
   const process = entry.process;
   entry.process = null;
   entry.starting = false;
+  entry.processGeneration += 1;
+
   if (!process || process.killed || process.exitCode !== null) return;
+  if (expectedGeneration !== entry.processGeneration - 1) return;
 
   process.kill("SIGTERM");
   setTimeout(() => {
@@ -300,10 +510,30 @@ function extractJpegFrames(entry: PoolEntry) {
     const frame = entry.stdoutBuffer.subarray(start, end + 2);
     entry.stdoutBuffer = entry.stdoutBuffer.subarray(end + 2);
     entry.latestJpeg = new Uint8Array(frame);
-    entry.errorKind = null;
-    entry.consecutiveFailures = 0;
+    clearAuthFailure(entry);
     entry.backoffMs = 1000;
     resolveWaiters(entry, entry.latestJpeg);
+    broadcastMjpegFrame(entry, entry.latestJpeg);
+  }
+}
+
+function broadcastMjpegFrame(entry: PoolEntry, jpeg: Uint8Array) {
+  for (const subscriber of entry.mjpegSubscribers.values()) {
+    try {
+      subscriber.onFrame(jpeg);
+    } catch {
+      // Client disconnected.
+    }
+  }
+}
+
+function notifyMjpegError(entry: PoolEntry, error: SnapshotErrorKind) {
+  for (const subscriber of entry.mjpegSubscribers.values()) {
+    try {
+      subscriber.onError?.(error);
+    } catch {
+      // Client disconnected.
+    }
   }
 }
 
@@ -382,7 +612,9 @@ function scheduleReconnect(entry: PoolEntry) {
 
   entry.reconnectTimer = setTimeout(() => {
     entry.reconnectTimer = null;
-    if (Date.now() - entry.lastRequestAt >= IDLE_EVICT_MS) {
+    if (entry.mjpegSubscribers.size > 0) {
+      touchEntry(entry);
+    } else if (Date.now() - entry.lastRequestAt >= IDLE_EVICT_MS) {
       evictSnapshotCamera(entry.cameraId);
       return;
     }
@@ -392,10 +624,12 @@ function scheduleReconnect(entry: PoolEntry) {
 }
 
 function stopEntry(entry: PoolEntry) {
+  cancelFpsUpgrade(entry);
   if (entry.idleTimer) {
     clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
   }
-  killFfmpegProcess(entry);
+  const generation = entry.processGeneration;
+  killFfmpegProcess(entry, generation);
   failWaiters(entry);
 }

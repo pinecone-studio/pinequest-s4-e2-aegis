@@ -1,14 +1,16 @@
 "use client";
 
-const MAX_CONCURRENT_SNAPSHOT_FETCHES = 6;
-const SNAPSHOT_POLL_INTERVAL_MS = 3500;
-const SNAPSHOT_JITTER_MS = 1800;
+export const BACKGROUND_SNAPSHOT_POLL_MS = 8000;
+export const BACKGROUND_SNAPSHOT_JITTER_MS = 2000;
+const MAX_CONCURRENT_SNAPSHOT_FETCHES = 3;
 const SNAPSHOT_TIMEOUT_MS = 10000;
 
 interface SnapshotSubscription {
   active: boolean;
   cameraId: string;
   streamUrl: string;
+  pollIntervalMs: number;
+  jitterMs: number;
   timeout: ReturnType<typeof setTimeout> | null;
   abortController: AbortController | null;
   onSnapshot: (blob: Blob) => void;
@@ -28,23 +30,29 @@ export function subscribeToSnapshots({
   streamUrl,
   onSnapshot,
   onError,
+  pollIntervalMs = BACKGROUND_SNAPSHOT_POLL_MS,
+  jitterMs = BACKGROUND_SNAPSHOT_JITTER_MS,
 }: {
   cameraId: string;
   streamUrl: string;
   onSnapshot: (blob: Blob) => void;
   onError: () => void;
+  pollIntervalMs?: number;
+  jitterMs?: number;
 }): () => void {
   const subscription: SnapshotSubscription = {
     active: true,
     cameraId,
     streamUrl,
+    pollIntervalMs,
+    jitterMs,
     timeout: null,
     abortController: null,
     onSnapshot,
     onError,
   };
 
-  scheduleNext(subscription, initialDelay(cameraId));
+  scheduleNext(subscription, initialDelay(cameraId, jitterMs));
 
   return () => {
     subscription.active = false;
@@ -127,7 +135,7 @@ async function runTask({ subscription }: SnapshotTask) {
     if (subscription.abortController === controller) {
       subscription.abortController = null;
     }
-    scheduleNext(subscription, nextDelay(subscription.cameraId));
+    scheduleNext(subscription, nextDelay(subscription));
   }
 }
 
@@ -140,12 +148,15 @@ function snapshotEndpoint(subscription: SnapshotSubscription): string {
   return `/api/snapshot/rtsp?${params.toString()}`;
 }
 
-function initialDelay(cameraId: string): number {
-  return hashCameraId(cameraId) % SNAPSHOT_JITTER_MS;
+function initialDelay(cameraId: string, jitterMs: number): number {
+  return hashCameraId(cameraId) % jitterMs;
 }
 
-function nextDelay(cameraId: string): number {
-  return SNAPSHOT_POLL_INTERVAL_MS + (hashCameraId(`${cameraId}:${Date.now()}`) % SNAPSHOT_JITTER_MS);
+function nextDelay(subscription: SnapshotSubscription): number {
+  return (
+    subscription.pollIntervalMs +
+    (hashCameraId(`${subscription.cameraId}:${Date.now()}`) % subscription.jitterMs)
+  );
 }
 
 function hashCameraId(value: string): number {
