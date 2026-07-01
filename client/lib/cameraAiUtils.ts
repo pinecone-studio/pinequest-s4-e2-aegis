@@ -17,6 +17,41 @@ type ViolationKind = {
   type: "smoking" | "vape" | "litter";
 };
 
+function loadImageFromDataUrl(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("failed to load frame"));
+    img.src = dataUrl;
+  });
+}
+
+/** Evidence capture from a snapshot data URL (background grid scans). */
+export async function captureEvidenceFromDataUrl(
+  dataUrl: string,
+  cameraId: string,
+  sourceLabel: string,
+  kind: ViolationKind,
+  confidence: number,
+  onEvent?: (event: EvidenceEvent) => void,
+  note?: string,
+): Promise<void> {
+  try {
+    const img = await loadImageFromDataUrl(dataUrl);
+    await captureEvidenceFromSource(
+      img,
+      cameraId,
+      sourceLabel,
+      kind,
+      confidence,
+      onEvent,
+      note,
+    );
+  } catch {
+    /* ignore decode errors */
+  }
+}
+
 export async function captureEvidenceFromSource(
   source: FrameSource,
   cameraId: string,
