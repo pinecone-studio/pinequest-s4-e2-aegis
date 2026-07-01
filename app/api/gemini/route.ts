@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
 // Gemini vision detection proxy. Keeps GEMINI_API_KEY server-side; the browser
-// never sees it. POST a JPEG (base64 / data URL) and get back:
+// never sees it. POST either:
+//   { image }    — a single JPEG (base64 / data URL), or
+//   { images }   — an ordered burst of JPEGs (oldest first), so Gemini can judge
+//                  littering as an ACTION across frames, not a single still.
+// Get back:
 //   { detections: [{ label, confidence, box:[x1,y1,x2,y2] }], summary }
 //
 // Returns the app's Detection contract directly (Cigarette/Vape/Litter/Person,
@@ -23,6 +27,26 @@ Respond with STRICT JSON of this exact shape, no markdown:
 {"summary":"one short sentence describing what you see and whether anything is illegal","detections":[{"label":"Cigarette|Vape|Litter|Person","confidence":0.0-1.0,"box":[x_min,y_min,x_max,y_max]}]}
 
 The "summary" is always required — describe the scene in plain language (e.g. "A person standing, no smoking or littering"). Coordinates are normalized 0.0-1.0, origin at top-left. If nothing notable is present, return {"summary":"...","detections":[]}.`;
+
+// Multi-frame prompt: the frames are an ordered burst from ONE camera, so the
+// model can reason about actions over time — crucial for littering, which is a
+// drop/abandon event, not a single-frame "is there trash" question.
+const PROMPT_TEMPORAL = `You are a surveillance vision system monitoring for SMOKING and LITTERING. You are given SEVERAL frames from the SAME fixed camera, in time order (oldest first), roughly half a second apart. Use the SEQUENCE — how things change between frames — to judge actions over time.
+
+Report:
+- "Cigarette": a cigarette held in a hand or at the mouth, lit or unlit.
+- "Vape": an e-cigarette / vape pen / pod / box mod held near the mouth or hand.
+- "Litter": LITTERING AS AN ACTION — across the frames a person carries or holds an object (bottle, can, cup, wrapper, bag, plastic item) and then DROPS or DISCARDS it and leaves it behind. Also report an item clearly already lying discarded on the ground. Someone simply holding or carrying a bottle, with no drop, is NOT littering — do not report it.
+- "Person": each visible person (secondary — context only).
+
+Be conservative: only report a Cigarette/Vape/Litter when you can CLEARLY see it. A hand near the face, a finger, a phone, a pen, jewelry, or fast movement (e.g. dancing) is NOT a cigarette — do not report one unless an actual cigarette/vape is visible. For Litter, require evidence of the drop/abandon across frames, or an item plainly discarded on the ground. When in doubt, do NOT report it. Only assign confidence above 0.7 when you are genuinely confident.
+
+Base all "box" coordinates on the LAST (most recent) frame.
+
+Respond with STRICT JSON of this exact shape, no markdown:
+{"summary":"one short sentence describing what happened across the frames and whether anything is illegal","detections":[{"label":"Cigarette|Vape|Litter|Person","confidence":0.0-1.0,"box":[x_min,y_min,x_max,y_max]}]}
+
+The "summary" is always required. Coordinates are normalized 0.0-1.0, origin at top-left. If nothing notable is present, return {"summary":"...","detections":[]}.`;
 
 interface RawBox {
   label?: string;
@@ -108,26 +132,35 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "GEMINI_API_KEY is not set" }, { status: 500 });
   }
 
-  let image: string;
+  const MAX_FRAMES = 8; // cap payload size — Gemini gets plenty of signal from a few
+  let images: string[];
   try {
     const body = await req.json();
-    image = String(body.image ?? "");
-    if (!image) throw new Error("missing image");
+    if (Array.isArray(body.images) && body.images.length > 0) {
+      images = body.images.map((i: unknown) => String(i ?? "")).filter(Boolean);
+    } else if (body.image) {
+      images = [String(body.image)];
+    } else {
+      throw new Error("missing image");
+    }
+    if (images.length === 0) throw new Error("missing image");
+    images = images.slice(0, MAX_FRAMES);
   } catch {
     return NextResponse.json({ error: "invalid request body" }, { status: 400 });
   }
 
-  const { data, mimeType } = parseImage(image);
+  // One image -> single-frame prompt; a burst -> temporal prompt (action over time).
+  const isTemporal = images.length > 1;
+  const parts: Array<Record<string, unknown>> = [
+    { text: isTemporal ? PROMPT_TEMPORAL : PROMPT },
+  ];
+  for (const img of images) {
+    const { data, mimeType } = parseImage(img);
+    parts.push({ inline_data: { mime_type: mimeType, data } });
+  }
 
   const requestBody = JSON.stringify({
-    contents: [
-      {
-        parts: [
-          { text: PROMPT },
-          { inline_data: { mime_type: mimeType, data } },
-        ],
-      },
-    ],
+    contents: [{ parts }],
     generationConfig: {
       temperature: 0,
       responseMimeType: "application/json",
@@ -168,7 +201,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       return NextResponse.json({ error: message, providerStatus: res.status }, { status: res.status });
     }
 
-    const payload = await res.json();
+    // Gemini can return 200 with an empty/non-JSON body under load; guard the
+    // parse so that becomes a clean 502 instead of an unhandled 500.
+    const rawBody = await res.text();
+    let payload: {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    try {
+      payload = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+      console.error("[gemini] non-JSON response", rawBody.slice(0, 200));
+      return NextResponse.json({ error: "empty or invalid response from Gemini" }, { status: 502 });
+    }
+
     const text: string =
       payload?.candidates?.[0]?.content?.parts?.map((p: { text?: string }) => p.text ?? "").join("") ??
       "{}";

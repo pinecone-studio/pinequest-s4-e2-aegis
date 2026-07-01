@@ -4,21 +4,32 @@ import { useEffect, useRef, useState } from "react";
 import { buildCameraStreamUrl } from "../lib/cameraApi";
 import type { CameraView } from "../lib/cameraTypes";
 import type { StreamLoadState } from "./CameraGrid";
-import { runInference } from "@/lib/inference";
-import { SMOKING_THRESHOLD } from "@/lib/modelConfig";
-import { CameraLitteringSession } from "@/lib/littering/pipeline";
+import type { Detection } from "@/lib/detection";
 import type { EvidenceEvent } from "@/lib/evidence";
 import {
   captureEvidenceFromSource,
   CIGARETTE_KIND,
-  drawDetectionBoxes,
   LITTER_KIND,
   VAPE_KIND,
 } from "@/lib/cameraAiUtils";
 
 const STREAM_LOAD_TIMEOUT_MS = 25000;
-const INFERENCE_INTERVAL_MS = 400;
 const CAPTURE_COOLDOWN_MS = 8000;
+
+// --- Cloud vision detection (Gemini) --------------------------------------
+const DETECT_ENDPOINT = "/api/gemini";
+const VERIFY_COOLDOWN_MS = 4000; // min gap between Gemini calls per camera
+const VIOLATION_THRESHOLD = 0.7; // ignore low-confidence guesses
+const POLL_INTERVAL_MS = 500; // how often the loop checks the cooldown
+const MAX_BACKOFF_STEPS = 4; // widen the cooldown under Gemini 503/429
+
+// One trip grabs a short ordered burst so Gemini can judge littering as an
+// ACTION (carry -> drop -> leave), at the cost of ONE cloud call per event.
+const BURST_FRAMES = 5;
+const BURST_INTERVAL_MS = 450;
+const BURST_JPEG_QUALITY = 0.78;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function cameraTitle(camera: CameraView) {
   return camera.name || camera.id;
@@ -49,11 +60,9 @@ export default function CameraCard({
 }) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const imgRef = useRef<HTMLImageElement>(null);
-  const overlayRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLElement>(null);
   const onEventRef = useRef(onEvent);
   const lastCaptureRef = useRef({ cigarette: 0, vape: 0, litter: 0 });
-  const litteringSessionRef = useRef<CameraLitteringSession | null>(null);
 
   const streamUrl = buildCameraStreamUrl(camera);
   const streamActive =
@@ -82,7 +91,6 @@ export default function CameraCard({
   useEffect(() => {
     setImageLoaded(false);
     lastCaptureRef.current = { cigarette: 0, vape: 0, litter: 0 };
-    litteringSessionRef.current = new CameraLitteringSession();
   }, [camera.id, camera.stream_url, camera.enabled]);
 
   useEffect(() => {
@@ -103,102 +111,108 @@ export default function CameraCard({
   }, [camera.id, camera.stream_url, camera.enabled, streamState, onStreamSettled]);
 
   useEffect(() => {
-    if (!showAi) {
-      const overlay = overlayRef.current;
-      overlay?.getContext("2d")?.clearRect(0, 0, overlay.width, overlay.height);
-      return undefined;
-    }
+    if (!showAi) return undefined;
 
     let running = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const sourceLabel = label;
+    let verifying = false;
+    let lastVerify = 0;
+    let backoff = 0; // grows on Gemini 503/429, widens the cooldown
 
-    const loop = async () => {
-      if (!running) return;
-
+    // Grab a short burst from the live stream <img> and ask Gemini to detect
+    // smoking / littering, then raise evidence events. (No box overlay.)
+    const verify = async () => {
       const img = imgRef.current;
-      const overlay = overlayRef.current;
-      const container = containerRef.current;
+      if (!img || img.naturalWidth === 0 || verifying) return;
 
-      if (img && overlay && container && img.naturalWidth > 0) {
-        try {
-          const { detections, litteringInputs } = await runInference(img);
-          const littering = litteringSessionRef.current?.process(litteringInputs) ?? {
-            events: [],
-            overlayDets: [],
-          };
-          const dets = [...detections, ...littering.overlayDets];
-          const { offsetWidth: w, offsetHeight: h } = container;
-          drawDetectionBoxes(overlay, dets, w, h);
+      verifying = true;
+      lastVerify = Date.now();
+      try {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
 
-          const now = Date.now();
-          const best = (detLabel: string) =>
-            dets
-              .filter((d) => d.label === detLabel)
-              .sort((a, b) => b.confidence - a.confidence)[0];
-
-          const cigarette = best("Cigarette");
-          if (
-            cigarette &&
-            cigarette.confidence >= SMOKING_THRESHOLD &&
-            now - lastCaptureRef.current.cigarette >= CAPTURE_COOLDOWN_MS
-          ) {
-            lastCaptureRef.current.cigarette = now;
-            void captureEvidenceFromSource(
-              img,
-              camera.id,
-              sourceLabel,
-              CIGARETTE_KIND,
-              cigarette.confidence,
-              onEventRef.current,
-            );
-          }
-
-          const vape = best("Vape");
-          if (
-            vape &&
-            vape.confidence >= SMOKING_THRESHOLD &&
-            now - lastCaptureRef.current.vape >= CAPTURE_COOLDOWN_MS
-          ) {
-            lastCaptureRef.current.vape = now;
-            void captureEvidenceFromSource(
-              img,
-              camera.id,
-              sourceLabel,
-              VAPE_KIND,
-              vape.confidence,
-              onEventRef.current,
-            );
-          }
-
-          const litter = littering.events[0];
-          if (
-            litter &&
-            now - lastCaptureRef.current.litter >= CAPTURE_COOLDOWN_MS
-          ) {
-            lastCaptureRef.current.litter = now;
-            void captureEvidenceFromSource(
-              img,
-              camera.id,
-              sourceLabel,
-              LITTER_KIND,
-              0.95,
-              onEventRef.current,
-            );
-          }
-        } catch (err) {
-          console.error(`[camera-ai:${camera.id}]`, err);
+        const images: string[] = [];
+        for (let f = 0; f < BURST_FRAMES; f++) {
+          const live = imgRef.current;
+          if (!live || live.naturalWidth === 0) break;
+          const snap = document.createElement("canvas");
+          snap.width = w;
+          snap.height = h;
+          snap.getContext("2d")?.drawImage(live, 0, 0, w, h);
+          images.push(snap.toDataURL("image/jpeg", BURST_JPEG_QUALITY));
+          if (f < BURST_FRAMES - 1) await sleep(BURST_INTERVAL_MS);
         }
-      }
+        if (!running || images.length === 0) return;
 
-      if (running) {
-        timer = setTimeout(() => {
-          void loop();
-        }, INFERENCE_INTERVAL_MS);
+        const res = await fetch(DETECT_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ images }),
+        });
+        if (!res.ok) {
+          // Gemini overloaded/rate-limited — back off so we stop hammering it.
+          if (res.status === 503 || res.status === 429) {
+            backoff = Math.min(backoff + 1, MAX_BACKOFF_STEPS);
+          }
+          return;
+        }
+        backoff = 0; // recovered — return to the normal cadence
+
+        const data = (await res.json()) as { detections?: Detection[]; summary?: string };
+        const raw = Array.isArray(data.detections) ? data.detections : [];
+        // Keep people (context) + only confident violations.
+        const dets = raw.filter(
+          (d) => d.label === "Person" || d.confidence >= VIOLATION_THRESHOLD,
+        );
+        const summary = (data.summary ?? "").trim();
+
+        const liveImg = imgRef.current;
+        if (!running || !liveImg) return;
+
+        const now = Date.now();
+        const best = (detLabel: string) =>
+          dets
+            .filter((d) => d.label === detLabel)
+            .sort((a, b) => b.confidence - a.confidence)[0];
+
+        const violations = [
+          { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette" as const },
+          { det: best("Vape"), kind: VAPE_KIND, key: "vape" as const },
+          { det: best("Litter"), kind: LITTER_KIND, key: "litter" as const },
+        ];
+        for (const { det, kind, key } of violations) {
+          if (det && now - lastCaptureRef.current[key] >= CAPTURE_COOLDOWN_MS) {
+            lastCaptureRef.current[key] = now;
+            void captureEvidenceFromSource(
+              liveImg,
+              camera.id,
+              sourceLabel,
+              kind,
+              det.confidence,
+              onEventRef.current,
+              summary || undefined,
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`[camera-ai:${camera.id}]`, err);
+      } finally {
+        // Count the cooldown from when the burst FINISHED so the ~1.8s capture
+        // span doesn't eat into the gap between cloud calls.
+        lastVerify = Date.now();
+        verifying = false;
       }
     };
 
-    void loop();
+    const loop = () => {
+      if (!running) return;
+      const effectiveCooldown = VERIFY_COOLDOWN_MS * (1 + backoff);
+      if (Date.now() - lastVerify >= effectiveCooldown) void verify();
+      timer = setTimeout(loop, POLL_INTERVAL_MS);
+    };
+
+    loop();
 
     return () => {
       running = false;
@@ -241,10 +255,6 @@ export default function CameraCard({
               setImageLoaded(false);
               onStreamSettled("stream_unavailable");
             }}
-          />
-          <canvas
-            ref={overlayRef}
-            className="absolute inset-0 h-full w-full pointer-events-none"
           />
           {streamState === "loading" && !imageLoaded ? (
             <div className="absolute inset-0 flex items-center justify-center text-[#8a8a8a] text-[12px] tracking-[0.08em] bg-[#0d0d0d]">
