@@ -3,30 +3,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { buildCameraStreamUrl } from "../lib/cameraApi";
 import type { CameraView } from "../lib/cameraTypes";
-import { subscribeToSnapshots } from "../lib/snapshotScheduler";
+import {
+  GRID_SNAPSHOT_JITTER_MS,
+  GRID_SNAPSHOT_POLL_MS,
+  subscribeToSnapshots,
+} from "../lib/snapshotScheduler";
 import type { StreamLoadState } from "./CameraGrid";
 import type { Detection } from "@/lib/detection";
 import type { EvidenceEvent } from "@/lib/evidence";
 import {
-  EVIDENCE_COOLDOWN_MS,
-  FRAME_HISTORY_MS,
-  GEMINI_BURST_FRAMES,
-  GEMINI_BURST_INTERVAL_MS,
-  GEMINI_COOLDOWN_MS,
-  GEMINI_FETCH_TIMEOUT_MS,
-  GEMINI_VIOLATION_THRESHOLD,
-} from "@/lib/aiConfig";
-import {
-  captureBurstForGemini,
   captureEvidenceFromSource,
   CIGARETTE_KIND,
-  imageToGeminiDataUrl,
   LITTER_KIND,
   VAPE_KIND,
 } from "@/lib/cameraAiUtils";
-import { detectMotion, type MotionSample } from "@/lib/motionGate";
 
 const STREAM_LOAD_TIMEOUT_MS = 25000;
+const CAPTURE_COOLDOWN_MS = 8000;
 const ALERT_FLASH_MS = 5000;
 
 type ViolationLabel = "Cigarette" | "Vape" | "Litter";
@@ -37,9 +30,20 @@ const VIOLATION_COLORS: Record<ViolationLabel, string> = {
   Litter: "#f97316",
 };
 
-function detectEndpoint(cameraId: string): string {
-  return `/api/gemini/${encodeURIComponent(cameraId)}`;
-}
+// --- Cloud vision detection (Gemini) --------------------------------------
+const DETECT_ENDPOINT = "/api/gemini";
+const VERIFY_COOLDOWN_MS = 4000; // min gap between Gemini calls per camera
+const VIOLATION_THRESHOLD = 0.7; // ignore low-confidence guesses
+const POLL_INTERVAL_MS = 500; // how often the loop checks the cooldown
+const MAX_BACKOFF_STEPS = 4; // widen the cooldown under Gemini 503/429
+
+// One trip grabs a short ordered burst so Gemini can judge littering as an
+// ACTION (carry -> drop -> leave), at the cost of ONE cloud call per event.
+const BURST_FRAMES = 5;
+const BURST_INTERVAL_MS = 450;
+const BURST_JPEG_QUALITY = 0.78;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function cameraTitle(camera: CameraView) {
   return camera.name || camera.id;
@@ -50,52 +54,55 @@ export default function CameraCard({
   label,
   streamState,
   selected,
-  deferSnapshots = false,
   clock,
   onSelect,
   onStreamSettled,
   onCredentialsRequest,
   aiReady = false,
+  aiActive = false,
+  gridPaused = false,
   onEvent,
+  onSnapshotPreview,
 }: {
   camera: CameraView;
   label: string;
   streamState: StreamLoadState;
   selected?: boolean;
-  deferSnapshots?: boolean;
   clock?: string;
   onSelect?: () => void;
-  onStreamSettled: (state: "online" | "stream_unavailable") => void;
+  onStreamSettled: (state: "loading" | "online" | "stream_unavailable") => void;
   onCredentialsRequest?: () => void;
   aiReady?: boolean;
+  aiActive?: boolean;
+  gridPaused?: boolean;
   onEvent?: (event: EvidenceEvent) => void;
+  onSnapshotPreview?: (previewUrl: string | null) => void;
 }) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
+  const [inView, setInView] = useState(true);
   const [analyzing, setAnalyzing] = useState(false);
   const [activeAlert, setActiveAlert] = useState<{
     label: ViolationLabel;
     confidence: number;
   } | null>(null);
+  const pollStartedRef = useRef(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLElement>(null);
   const onEventRef = useRef(onEvent);
   const onStreamSettledRef = useRef(onStreamSettled);
+  const onSnapshotPreviewRef = useRef(onSnapshotPreview);
   const snapshotUrlRef = useRef<string | null>(null);
   const lastCaptureRef = useRef({ cigarette: 0, vape: 0, litter: 0 });
-  const motionSampleRef = useRef<MotionSample | null>(null);
-  const frameHistoryRef = useRef<{ dataUrl: string; at: number }[]>([]);
-  const lastGeminiAtRef = useRef(0);
-  const verifyInFlightRef = useRef(false);
-  const aiMonitoringRef = useRef(false);
   const alertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const streamUrl = buildCameraStreamUrl(camera);
   const streamActive =
     camera.enabled !== false && (streamState === "loading" || streamState === "online");
+  const snapshotsEnabled = streamActive && Boolean(streamUrl) && inView && !gridPaused;
   const showStream = streamActive;
-  const aiMonitoring = aiReady && streamState === "online" && imageLoaded;
-  aiMonitoringRef.current = aiMonitoring;
+  const showAi =
+    aiReady && aiActive && streamState === "online" && imageLoaded && inView && !gridPaused;
 
   const isDisabled = camera.enabled === false;
   const isUnavailable = streamState === "stream_unavailable";
@@ -106,7 +113,7 @@ export default function CameraCard({
     : isUnavailable
       ? "#ef4444"
       : isOnline
-        ? aiMonitoring
+        ? showAi
           ? "#f0652c"
           : "#22c55e"
         : "#eab308";
@@ -120,12 +127,38 @@ export default function CameraCard({
   }, [onStreamSettled]);
 
   useEffect(() => {
+    onSnapshotPreviewRef.current = onSnapshotPreview;
+  }, [onSnapshotPreview]);
+
+  useEffect(() => {
     return () => {
       if (alertTimerRef.current) clearTimeout(alertTimerRef.current);
     };
   }, []);
 
+  const flashAlert = useCallback((violationLabel: ViolationLabel, confidence: number) => {
+    setActiveAlert({ label: violationLabel, confidence });
+    if (alertTimerRef.current) clearTimeout(alertTimerRef.current);
+    alertTimerRef.current = setTimeout(() => setActiveAlert(null), ALERT_FLASH_MS);
+  }, []);
+
   useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return undefined;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setInView(entry.isIntersecting);
+      },
+      { root: null, rootMargin: "120px 0px", threshold: 0 },
+    );
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [camera.id]);
+
+  useEffect(() => {
+    pollStartedRef.current = false;
     setImageLoaded(false);
     setSnapshotUrl(null);
     setActiveAlert(null);
@@ -134,170 +167,30 @@ export default function CameraCard({
       snapshotUrlRef.current = null;
     }
     lastCaptureRef.current = { cigarette: 0, vape: 0, litter: 0 };
-    motionSampleRef.current = null;
-    frameHistoryRef.current = [];
-    lastGeminiAtRef.current = 0;
+    onSnapshotPreviewRef.current?.(null);
   }, [camera.id, camera.stream_url, camera.enabled]);
 
-  const flashAlert = useCallback((label: ViolationLabel, confidence: number) => {
-    setActiveAlert({ label, confidence });
-    if (alertTimerRef.current) clearTimeout(alertTimerRef.current);
-    alertTimerRef.current = setTimeout(() => setActiveAlert(null), ALERT_FLASH_MS);
-  }, []);
-
-  const runGeminiVerify = useCallback(async () => {
-    if (verifyInFlightRef.current || !aiMonitoringRef.current) return;
-
-    const img = imgRef.current;
-    if (!img || img.naturalWidth === 0) return;
-
-    verifyInFlightRef.current = true;
-    lastGeminiAtRef.current = Date.now();
-    setAnalyzing(true);
-
-    try {
-      const now = Date.now();
-      const history = frameHistoryRef.current.filter((f) => now - f.at < FRAME_HISTORY_MS);
-      let images =
-        history.length >= 2
-          ? [history[history.length - 2].dataUrl, history[history.length - 1].dataUrl]
-          : history.length === 1
-            ? [history[0].dataUrl]
-            : [];
-
-      if (images.length < GEMINI_BURST_FRAMES) {
-        const burst = await captureBurstForGemini(
-          img,
-          GEMINI_BURST_FRAMES,
-          GEMINI_BURST_INTERVAL_MS,
-          () => imgRef.current,
-        );
-        if (burst.length > 0) images = burst;
-      }
-
-      if (images.length === 0) return;
-
-      const controller = new AbortController();
-      const fetchTimeout = window.setTimeout(
-        () => controller.abort(),
-        GEMINI_FETCH_TIMEOUT_MS,
-      );
-
-      let data: { detections?: Detection[]; summary?: string };
-      try {
-        const res = await fetch(detectEndpoint(camera.id), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ images }),
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          throw new Error(`Gemini HTTP ${res.status}`);
-        }
-        data = (await res.json()) as { detections?: Detection[]; summary?: string };
-      } finally {
-        window.clearTimeout(fetchTimeout);
-      }
-
-      const raw = Array.isArray(data.detections) ? data.detections : [];
-      const dets = raw.filter(
-        (d) => d.label === "Person" || d.confidence >= GEMINI_VIOLATION_THRESHOLD,
-      );
-      const summary = (data.summary ?? "").trim();
-
-      const liveImg = imgRef.current;
-      if (!liveImg) return;
-
-      const ts = Date.now();
-      const best = (detLabel: string) =>
-        dets
-          .filter((d) => d.label === detLabel)
-          .sort((a, b) => b.confidence - a.confidence)[0];
-
-      const violations: {
-        det: Detection | undefined;
-        kind: typeof CIGARETTE_KIND;
-        key: "cigarette" | "vape" | "litter";
-        label: ViolationLabel;
-      }[] = [
-        { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette", label: "Cigarette" },
-        { det: best("Vape"), kind: VAPE_KIND, key: "vape", label: "Vape" },
-        { det: best("Litter"), kind: LITTER_KIND, key: "litter", label: "Litter" },
-      ];
-      for (const { det, kind, key, label: violationLabel } of violations) {
-        if (!det) continue;
-        flashAlert(violationLabel, det.confidence);
-        if (ts - lastCaptureRef.current[key] >= EVIDENCE_COOLDOWN_MS) {
-          lastCaptureRef.current[key] = ts;
-          void captureEvidenceFromSource(
-            liveImg,
-            camera.id,
-            label,
-            kind,
-            det.confidence,
-            onEventRef.current,
-            summary || undefined,
-          );
-        }
-      }
-    } catch (err) {
-      const isAbort = err instanceof DOMException && err.name === "AbortError";
-      if (!isAbort) {
-        console.warn(`[camera-ai:${camera.id}]`, err);
-      }
-    } finally {
-      verifyInFlightRef.current = false;
-      setAnalyzing(false);
+  useEffect(() => {
+    if (!snapshotsEnabled) {
+      pollStartedRef.current = false;
+      return undefined;
     }
-  }, [camera.id, flashAlert, label]);
 
-  const handleFrameReady = useCallback(
-    (img: HTMLImageElement) => {
-      setImageLoaded(true);
+    pollStartedRef.current = true;
 
-      const dataUrl = imageToGeminiDataUrl(img);
-      if (!dataUrl) return;
-
-      const now = Date.now();
-      frameHistoryRef.current = [
-        ...frameHistoryRef.current.filter((f) => now - f.at < FRAME_HISTORY_MS),
-        { dataUrl, at: now },
-      ].slice(-3);
-
-      if (!aiMonitoringRef.current) return;
-      if (verifyInFlightRef.current) return;
-      if (now - lastGeminiAtRef.current < GEMINI_COOLDOWN_MS) return;
-
-      const motion = detectMotion(img, motionSampleRef.current);
-      if (!motion) return;
-      motionSampleRef.current = motion.sample;
-
-      if (!motion.motionDetected) return;
-
-      void runGeminiVerify();
-    },
-    [runGeminiVerify],
-  );
-
-  useEffect(() => {
-    if (!deferSnapshots) return;
-    onStreamSettledRef.current("online");
-    setImageLoaded(true);
-  }, [deferSnapshots, camera.id]);
-
-  useEffect(() => {
-    if (!showStream || !streamUrl || deferSnapshots) return undefined;
-
-    const controls = subscribeToSnapshots({
+    return subscribeToSnapshots({
       cameraId: camera.id,
       streamUrl,
-      priority: selected ? "high" : "normal",
+      pollIntervalMs: GRID_SNAPSHOT_POLL_MS,
+      jitterMs: GRID_SNAPSHOT_JITTER_MS,
       onSnapshot: (blob) => {
         const nextUrl = URL.createObjectURL(blob);
         const previousUrl = snapshotUrlRef.current;
         snapshotUrlRef.current = nextUrl;
         setSnapshotUrl(nextUrl);
+        setImageLoaded(true);
         onStreamSettledRef.current("online");
+        onSnapshotPreviewRef.current?.(nextUrl);
         if (previousUrl) {
           URL.revokeObjectURL(previousUrl);
         }
@@ -308,26 +201,31 @@ export default function CameraCard({
         }
       },
     });
+  }, [camera.id, snapshotsEnabled, streamUrl]);
 
-    const node = containerRef.current;
-    if (!node || typeof IntersectionObserver === "undefined") {
-      return controls.unsubscribe;
+  useEffect(() => {
+    if (
+      !pollStartedRef.current ||
+      !snapshotsEnabled ||
+      camera.enabled === false ||
+      streamState !== "loading"
+    ) {
+      return;
     }
 
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries.some((entry) => entry.isIntersecting);
-        controls.setVisible(visible);
-      },
-      { rootMargin: "80px", threshold: 0.05 },
-    );
-    observer.observe(node);
+    const timeout = window.setTimeout(() => {
+      setImageLoaded((loaded) => {
+        if (!loaded && pollStartedRef.current) {
+          onStreamSettledRef.current("stream_unavailable");
+        }
+        return loaded;
+      });
+    }, STREAM_LOAD_TIMEOUT_MS);
 
     return () => {
-      observer.disconnect();
-      controls.unsubscribe();
+      window.clearTimeout(timeout);
     };
-  }, [camera.id, showStream, streamUrl, selected, deferSnapshots]);
+  }, [camera.id, camera.stream_url, camera.enabled, snapshotsEnabled, streamState]);
 
   useEffect(() => {
     return () => {
@@ -339,18 +237,124 @@ export default function CameraCard({
   }, []);
 
   useEffect(() => {
-    if (camera.enabled === false || streamState !== "loading" || deferSnapshots) return;
+    if (!showAi) return undefined;
 
-    const timeout = window.setTimeout(() => {
-      if (!snapshotUrlRef.current) {
-        onStreamSettledRef.current("stream_unavailable");
+    let running = true;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const sourceLabel = label;
+    let verifying = false;
+    let lastVerify = 0;
+    let backoff = 0; // grows on Gemini 503/429, widens the cooldown
+
+    // Grab a short burst from the live stream <img> and ask Gemini to detect
+    // smoking / littering, then raise evidence events + flash an on-tile alert.
+    const verify = async () => {
+      const img = imgRef.current;
+      if (!img || img.naturalWidth === 0 || verifying) return;
+
+      verifying = true;
+      lastVerify = Date.now();
+      setAnalyzing(true);
+      try {
+        const w = img.naturalWidth;
+        const h = img.naturalHeight;
+
+        const images: string[] = [];
+        for (let f = 0; f < BURST_FRAMES; f++) {
+          const live = imgRef.current;
+          if (!live || live.naturalWidth === 0) break;
+          const snap = document.createElement("canvas");
+          snap.width = w;
+          snap.height = h;
+          snap.getContext("2d")?.drawImage(live, 0, 0, w, h);
+          images.push(snap.toDataURL("image/jpeg", BURST_JPEG_QUALITY));
+          if (f < BURST_FRAMES - 1) await sleep(BURST_INTERVAL_MS);
+        }
+        if (!running || images.length === 0) return;
+
+        const res = await fetch(DETECT_ENDPOINT, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ images }),
+        });
+        if (!res.ok) {
+          // Gemini overloaded/rate-limited — back off so we stop hammering it.
+          if (res.status === 503 || res.status === 429) {
+            backoff = Math.min(backoff + 1, MAX_BACKOFF_STEPS);
+          }
+          return;
+        }
+        backoff = 0; // recovered — return to the normal cadence
+
+        const data = (await res.json()) as { detections?: Detection[]; summary?: string };
+        const raw = Array.isArray(data.detections) ? data.detections : [];
+        // Keep people (context) + only confident violations.
+        const dets = raw.filter(
+          (d) => d.label === "Person" || d.confidence >= VIOLATION_THRESHOLD,
+        );
+        const summary = (data.summary ?? "").trim();
+
+        const liveImg = imgRef.current;
+        if (!running || !liveImg) return;
+
+        const now = Date.now();
+        const best = (detLabel: string) =>
+          dets
+            .filter((d) => d.label === detLabel)
+            .sort((a, b) => b.confidence - a.confidence)[0];
+
+        const violations: {
+          det: Detection | undefined;
+          kind: typeof CIGARETTE_KIND;
+          key: "cigarette" | "vape" | "litter";
+        }[] = [
+          { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette" },
+          { det: best("Vape"), kind: VAPE_KIND, key: "vape" },
+          { det: best("Litter"), kind: LITTER_KIND, key: "litter" },
+        ];
+        for (const { det, kind, key } of violations) {
+          if (!det) continue;
+          // Flash the on-tile alert on every confident hit…
+          if (running) flashAlert(kind.label, det.confidence);
+          // …but only save one evidence snapshot per type per cooldown window.
+          if (now - lastCaptureRef.current[key] >= CAPTURE_COOLDOWN_MS) {
+            lastCaptureRef.current[key] = now;
+            void captureEvidenceFromSource(
+              liveImg,
+              camera.id,
+              sourceLabel,
+              kind,
+              det.confidence,
+              onEventRef.current,
+              summary || undefined,
+            );
+          }
+        }
+      } catch (err) {
+        console.error(`[camera-ai:${camera.id}]`, err);
+      } finally {
+        // Count the cooldown from when the burst FINISHED so the ~1.8s capture
+        // span doesn't eat into the gap between cloud calls.
+        lastVerify = Date.now();
+        verifying = false;
+        setAnalyzing(false);
       }
-    }, STREAM_LOAD_TIMEOUT_MS);
+    };
+
+    const loop = () => {
+      if (!running) return;
+      const effectiveCooldown = VERIFY_COOLDOWN_MS * (1 + backoff);
+      if (Date.now() - lastVerify >= effectiveCooldown) void verify();
+      timer = setTimeout(loop, POLL_INTERVAL_MS);
+    };
+
+    loop();
 
     return () => {
-      window.clearTimeout(timeout);
+      running = false;
+      if (timer) clearTimeout(timer);
     };
-  }, [camera.id, camera.stream_url, camera.enabled, streamState]);
+  }, [showAi, camera.id, label, flashAlert]);
 
   const handleUnavailableClick = () => {
     if (isUnavailable && onCredentialsRequest) {
@@ -360,23 +364,12 @@ export default function CameraCard({
     onSelect?.();
   };
 
-  const toggleFullscreen = useCallback(() => {
-    const node = containerRef.current;
-    if (!node) return;
-    if (document.fullscreenElement) {
-      void document.exitFullscreen().catch(() => undefined);
-    } else {
-      void node.requestFullscreen?.().catch(() => undefined);
-    }
-  }, []);
-
   const alertColor = activeAlert ? VIOLATION_COLORS[activeAlert.label] : "#f0652c";
 
   return (
     <article
       ref={containerRef}
-      title="Double-click for fullscreen"
-      className={`group relative aspect-video w-full overflow-hidden rounded-[10px] bg-black transition-shadow duration-300 ${
+      className={`relative aspect-video w-full overflow-hidden rounded-[10px] bg-black transition-shadow duration-300 ${
         onSelect || onCredentialsRequest ? "cursor-pointer" : "cursor-default"
       } ${
         activeAlert
@@ -386,23 +379,18 @@ export default function CameraCard({
             : "border border-[#272727]"
       }`}
       onClick={handleUnavailableClick}
-      onDoubleClick={toggleFullscreen}
     >
       {showStream ? (
         <>
-          {deferSnapshots ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-[#0d0d0d] text-[#6b6b6b]">
-              <span className="text-[10px] font-semibold uppercase tracking-[0.12em]">Live in preview</span>
-            </div>
-          ) : snapshotUrl ? (
+          {snapshotUrl ? (
             <img
               key={camera.id}
               ref={imgRef}
               src={snapshotUrl}
               alt={cameraTitle(camera)}
               className="block h-full w-full object-cover"
-              onLoad={(event) => {
-                handleFrameReady(event.currentTarget);
+              onLoad={() => {
+                setImageLoaded(true);
               }}
               onError={() => {
                 setImageLoaded(false);
@@ -429,7 +417,7 @@ export default function CameraCard({
         </div>
       )}
 
-      {aiMonitoring && analyzing ? (
+      {showAi && analyzing ? (
         <div
           className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-[#f0652c] to-transparent animate-[scan-line_2s_linear_infinite]"
           aria-hidden
@@ -438,7 +426,7 @@ export default function CameraCard({
 
       <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(to_top,rgba(0,0,0,0.55)_0%,rgba(0,0,0,0)_34%)]" />
 
-      {/* Top-left: LIVE badge + timestamp (burned-in CCTV overlay) */}
+      {/* Top-left: LIVE badge + burned-in timestamp */}
       <div className="pointer-events-none absolute left-2.5 top-2.5 flex items-center gap-1.5">
         {isOnline ? (
           <span className="flex items-center gap-1 rounded bg-[rgba(0,0,0,0.55)] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em] text-white backdrop-blur-sm">
@@ -454,7 +442,7 @@ export default function CameraCard({
       </div>
 
       {/* Top-right: AI status */}
-      {aiMonitoring ? (
+      {showAi ? (
         <div className="pointer-events-none absolute right-2.5 top-2.5">
           <span
             className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] backdrop-blur-sm ${
@@ -507,7 +495,7 @@ export default function CameraCard({
           event.stopPropagation();
           onCredentialsRequest?.();
         }}
-        className="absolute right-2.5 bottom-2 w-6 h-6 flex items-center justify-center border-none bg-transparent text-[rgba(255,255,255,0.75)] cursor-pointer opacity-0 transition-opacity group-hover:opacity-100"
+        className="absolute right-2.5 bottom-2 w-6 h-6 flex items-center justify-center border-none bg-transparent text-[rgba(255,255,255,0.75)] cursor-pointer"
       >
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="3" y="11" width="18" height="11" rx="2" />

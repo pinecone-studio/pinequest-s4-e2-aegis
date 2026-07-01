@@ -242,7 +242,7 @@ export default function HomePage() {
       if (current && cams.some((camera) => camera.id === current)) {
         return current;
       }
-      return cams[0]?.id ?? null;
+      return null;
     });
   }, []);
 
