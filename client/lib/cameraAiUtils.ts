@@ -8,7 +8,7 @@ import { getSourceSize } from "./frameSource";
 
 const THUMB_WIDTH = 200;
 
-/** Max width sent to /api/gemini — keeps POST bodies small so the dev server stays responsive. */
+/** Max width sent to /api/vision — keeps POST bodies small so the dev server stays responsive. */
 export const GEMINI_MAX_FRAME_WIDTH = 640;
 export const GEMINI_JPEG_QUALITY = 0.72;
 

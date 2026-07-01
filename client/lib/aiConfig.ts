@@ -7,6 +7,9 @@ export const MOTION_SAMPLE_HEIGHT = 48;
 /** Differing sample pixels required to treat a frame as "motion". */
 export const MOTION_PIXEL_THRESHOLD = 28;
 
+/** Keep running YOLO briefly after a person was seen (standing still = low motion). */
+export const PERSON_STICKY_MS = 20_000;
+
 /** Per-camera minimum gap between Gemini calls (ms). */
 export const GEMINI_COOLDOWN_MS = 6_000;
 
