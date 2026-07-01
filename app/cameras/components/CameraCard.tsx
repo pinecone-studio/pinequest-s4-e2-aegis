@@ -3,7 +3,11 @@
 import { useEffect, useRef, useState } from "react";
 import { buildCameraStreamUrl } from "../lib/cameraApi";
 import type { CameraView } from "../lib/cameraTypes";
-import { subscribeToSnapshots } from "../lib/snapshotScheduler";
+import {
+  GRID_SNAPSHOT_JITTER_MS,
+  GRID_SNAPSHOT_POLL_MS,
+  subscribeToSnapshots,
+} from "../lib/snapshotScheduler";
 import type { StreamLoadState } from "./CameraGrid";
 import type { Detection } from "@/lib/detection";
 import type { EvidenceEvent } from "@/lib/evidence";
@@ -46,6 +50,7 @@ export default function CameraCard({
   onCredentialsRequest,
   aiReady = false,
   aiActive = false,
+  gridPaused = false,
   onEvent,
   onSnapshotPreview,
 }: {
@@ -54,15 +59,18 @@ export default function CameraCard({
   streamState: StreamLoadState;
   selected?: boolean;
   onSelect?: () => void;
-  onStreamSettled: (state: "online" | "stream_unavailable") => void;
+  onStreamSettled: (state: "loading" | "online" | "stream_unavailable") => void;
   onCredentialsRequest?: () => void;
   aiReady?: boolean;
   aiActive?: boolean;
+  gridPaused?: boolean;
   onEvent?: (event: EvidenceEvent) => void;
   onSnapshotPreview?: (previewUrl: string | null) => void;
 }) {
   const [imageLoaded, setImageLoaded] = useState(false);
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
+  const [inView, setInView] = useState(true);
+  const pollStartedRef = useRef(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLElement>(null);
   const onEventRef = useRef(onEvent);
@@ -74,8 +82,10 @@ export default function CameraCard({
   const streamUrl = buildCameraStreamUrl(camera);
   const streamActive =
     camera.enabled !== false && (streamState === "loading" || streamState === "online");
+  const snapshotsEnabled = streamActive && Boolean(streamUrl) && inView && !gridPaused;
   const showStream = streamActive;
-  const showAi = aiReady && aiActive && streamState === "online" && imageLoaded;
+  const showAi =
+    aiReady && aiActive && streamState === "online" && imageLoaded && inView && !gridPaused;
 
   const isDisabled = camera.enabled === false;
   const isUnavailable = streamState === "stream_unavailable";
@@ -104,6 +114,28 @@ export default function CameraCard({
   }, [onSnapshotPreview]);
 
   useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return undefined;
+
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        setInView(entry.isIntersecting);
+      },
+      { root: null, rootMargin: "120px 0px", threshold: 0 },
+    );
+
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [camera.id]);
+
+  useEffect(() => {
+    if (snapshotsEnabled && streamState === "stream_unavailable") {
+      onStreamSettledRef.current("loading");
+    }
+  }, [snapshotsEnabled, streamState]);
+
+  useEffect(() => {
+    pollStartedRef.current = false;
     setImageLoaded(false);
     setSnapshotUrl(null);
     if (snapshotUrlRef.current) {
@@ -115,11 +147,18 @@ export default function CameraCard({
   }, [camera.id, camera.stream_url, camera.enabled]);
 
   useEffect(() => {
-    if (!showStream || !streamUrl) return undefined;
+    if (!snapshotsEnabled) {
+      pollStartedRef.current = false;
+      return undefined;
+    }
+
+    pollStartedRef.current = true;
 
     return subscribeToSnapshots({
       cameraId: camera.id,
       streamUrl,
+      pollIntervalMs: GRID_SNAPSHOT_POLL_MS,
+      jitterMs: GRID_SNAPSHOT_JITTER_MS,
       onSnapshot: (blob) => {
         const nextUrl = URL.createObjectURL(blob);
         const previousUrl = snapshotUrlRef.current;
@@ -138,23 +177,21 @@ export default function CameraCard({
         }
       },
     });
-  }, [camera.id, showStream, streamUrl]);
+  }, [camera.id, snapshotsEnabled, streamUrl]);
 
   useEffect(() => {
-    return () => {
-      if (snapshotUrlRef.current) {
-        URL.revokeObjectURL(snapshotUrlRef.current);
-        snapshotUrlRef.current = null;
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (camera.enabled === false || streamState !== "loading") return;
+    if (
+      !pollStartedRef.current ||
+      !snapshotsEnabled ||
+      camera.enabled === false ||
+      streamState !== "loading"
+    ) {
+      return;
+    }
 
     const timeout = window.setTimeout(() => {
       setImageLoaded((loaded) => {
-        if (!loaded) {
+        if (!loaded && pollStartedRef.current) {
           onStreamSettledRef.current("stream_unavailable");
         }
         return loaded;
@@ -164,7 +201,16 @@ export default function CameraCard({
     return () => {
       window.clearTimeout(timeout);
     };
-  }, [camera.id, camera.stream_url, camera.enabled, streamState]);
+  }, [camera.id, camera.stream_url, camera.enabled, snapshotsEnabled, streamState]);
+
+  useEffect(() => {
+    return () => {
+      if (snapshotUrlRef.current) {
+        URL.revokeObjectURL(snapshotUrlRef.current);
+        snapshotUrlRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!showAi) return undefined;

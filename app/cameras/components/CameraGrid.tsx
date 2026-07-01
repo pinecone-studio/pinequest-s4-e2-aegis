@@ -185,6 +185,8 @@ export default function CameraGrid({
     delete snapshotPreviewRef.current[cameraId];
   };
 
+  const gridPaused = expandedCamera !== null;
+
   if (cappedCameras.length === 0) {
     return (
       <div className="flex aspect-video items-center justify-center rounded-[10px] border border-[#272727] bg-[#1a1a1a] text-[#8a8a8a] text-[13px]">
@@ -232,7 +234,8 @@ export default function CameraGrid({
               onCredentialsRequest ? () => onCredentialsRequest(camera.id) : undefined
             }
             aiReady={aiReady}
-            aiActive={aiCameraIds.has(camera.id)}
+            aiActive={aiCameraIds.has(camera.id) && !gridPaused}
+            gridPaused={gridPaused}
             onSnapshotPreview={(previewUrl) => handleSnapshotPreview(camera.id, previewUrl)}
             onEvent={onEvent}
           />
