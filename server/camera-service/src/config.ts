@@ -8,12 +8,20 @@ export const RTSP_PATH_CANDIDATES = [
   "/stream1",
   "/stream2",
   "/live",
+  "/live/ch0",
   "/live.sdp",
   "/Streaming/Channels/101",
   "/Streaming/Channels/1",
   "/cam/realmonitor?channel=1&subtype=0",
   "/h264/ch1/main/av_stream",
   "/h264Preview_01_main",
+  "/h264Preview_01_sub",
+  "/11",
+  "/12",
+  "/h264",
+  "/onvif1",
+  "/media/video1",
+  "/profile1",
 ];
 
 export const DEFAULT_CREDENTIALS = [
