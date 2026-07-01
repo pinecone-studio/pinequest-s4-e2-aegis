@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CameraGrid from "./cameras/components/CameraGrid";
+import BackgroundScanner from "./cameras/components/BackgroundScanner";
 import CameraCredentialsModal, {
   type CameraCredentials,
 } from "./cameras/components/CameraCredentialsModal";
@@ -580,7 +581,9 @@ export default function HomePage() {
                   {cameraLoadError}
                 </div>
               ) : (
-                <CameraGrid
+                <>
+                  <BackgroundScanner cameras={cameras} aiReady={aiReady} />
+                  <CameraGrid
                   cameras={filteredCameras}
                   columns={columns}
                   selectedId={selectedId}
@@ -591,6 +594,7 @@ export default function HomePage() {
                   aiReady={aiReady}
                   onEvent={handleEvent}
                 />
+                </>
               )}
             </div>
 

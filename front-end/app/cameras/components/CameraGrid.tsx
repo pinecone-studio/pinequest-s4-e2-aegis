@@ -3,13 +3,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import CameraCard from "./CameraCard";
 import CameraExpandDialog from "./CameraExpandDialog";
+import { getCameraScanState } from "../lib/cameraScanStore";
 import type { CameraView } from "../lib/cameraTypes";
 import type { EvidenceEvent } from "@/lib/evidence";
 
-// How many visible cameras may run Gemini AI at once. Tuned for the paid key +
-// GEMINI_MAX_CONCURRENT so a full 4x4 wall can be analyzed in parallel; lower it
-// to cut cost, or set it below the wall size to prioritise the selected camera.
-const MAX_AI_CAMERAS = 16;
 const CAMERA_RENDER_CHUNK_SIZE = 8;
 const MAX_RENDERED_CAMERAS = 50;
 
@@ -94,7 +91,14 @@ export default function CameraGrid({
       let changed = false;
 
       for (const cameraId of loadableCameraIds) {
-        next[cameraId] = current[cameraId] ?? "not_started";
+        const cached = getCameraScanState(cameraId);
+        const cachedState =
+          cached.status === "online"
+            ? "online"
+            : cached.status === "unavailable"
+              ? "stream_unavailable"
+              : (current[cameraId] ?? "not_started");
+        next[cameraId] = cachedState;
         if (next[cameraId] !== current[cameraId]) {
           changed = true;
         }
@@ -146,19 +150,6 @@ export default function CameraGrid({
     });
   }, [loadableCameraIdsKey]);
 
-  const aiCameraIds = useMemo(() => {
-    const online = renderCameras.filter((c) => c.enabled !== false).map((c) => c.id);
-    const ids = new Set<string>();
-    if (selectedId && online.includes(selectedId)) {
-      ids.add(selectedId);
-    }
-    for (const id of online) {
-      if (ids.size >= MAX_AI_CAMERAS) break;
-      ids.add(id);
-    }
-    return ids;
-  }, [renderCameras, selectedId]);
-
   const expandedCamera = useMemo(
     () =>
       expandedCameraId
@@ -169,7 +160,9 @@ export default function CameraGrid({
 
   const handleExpandCamera = (cameraId: string) => {
     setExpandedCameraId(cameraId);
-    setExpandedPreviewUrl(snapshotPreviewRef.current[cameraId] ?? null);
+    setExpandedPreviewUrl(
+      snapshotPreviewRef.current[cameraId] ?? getCameraScanState(cameraId).snapshotUrl,
+    );
     onSelect?.(cameraId);
   };
 
@@ -241,7 +234,6 @@ export default function CameraGrid({
               onCredentialsRequest ? () => onCredentialsRequest(camera.id) : undefined
             }
             aiReady={aiReady}
-            aiActive={aiCameraIds.has(camera.id) && !gridPaused}
             gridPaused={gridPaused}
             onSnapshotPreview={(previewUrl) => handleSnapshotPreview(camera.id, previewUrl)}
             onEvent={onEvent}
