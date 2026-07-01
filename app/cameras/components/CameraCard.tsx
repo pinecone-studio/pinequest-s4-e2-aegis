@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { buildCameraStreamUrl } from "../lib/cameraApi";
 import type { CameraView } from "../lib/cameraTypes";
 import {
@@ -20,6 +20,15 @@ import {
 
 const STREAM_LOAD_TIMEOUT_MS = 25000;
 const CAPTURE_COOLDOWN_MS = 8000;
+const ALERT_FLASH_MS = 5000;
+
+type ViolationLabel = "Cigarette" | "Vape" | "Litter";
+
+const VIOLATION_COLORS: Record<ViolationLabel, string> = {
+  Cigarette: "#ef4444",
+  Vape: "#a855f7",
+  Litter: "#f97316",
+};
 
 // --- Cloud vision detection (Gemini) --------------------------------------
 const DETECT_ENDPOINT = "/api/gemini";
@@ -45,6 +54,7 @@ export default function CameraCard({
   label,
   streamState,
   selected,
+  clock,
   onSelect,
   onStreamSettled,
   onCredentialsRequest,
@@ -58,6 +68,7 @@ export default function CameraCard({
   label: string;
   streamState: StreamLoadState;
   selected?: boolean;
+  clock?: string;
   onSelect?: () => void;
   onStreamSettled: (state: "loading" | "online" | "stream_unavailable") => void;
   onCredentialsRequest?: () => void;
@@ -70,6 +81,11 @@ export default function CameraCard({
   const [imageLoaded, setImageLoaded] = useState(false);
   const [snapshotUrl, setSnapshotUrl] = useState<string | null>(null);
   const [inView, setInView] = useState(true);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [activeAlert, setActiveAlert] = useState<{
+    label: ViolationLabel;
+    confidence: number;
+  } | null>(null);
   const pollStartedRef = useRef(false);
   const imgRef = useRef<HTMLImageElement>(null);
   const containerRef = useRef<HTMLElement>(null);
@@ -78,6 +94,7 @@ export default function CameraCard({
   const onSnapshotPreviewRef = useRef(onSnapshotPreview);
   const snapshotUrlRef = useRef<string | null>(null);
   const lastCaptureRef = useRef({ cigarette: 0, vape: 0, litter: 0 });
+  const alertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const streamUrl = buildCameraStreamUrl(camera);
   const streamActive =
@@ -114,6 +131,18 @@ export default function CameraCard({
   }, [onSnapshotPreview]);
 
   useEffect(() => {
+    return () => {
+      if (alertTimerRef.current) clearTimeout(alertTimerRef.current);
+    };
+  }, []);
+
+  const flashAlert = useCallback((violationLabel: ViolationLabel, confidence: number) => {
+    setActiveAlert({ label: violationLabel, confidence });
+    if (alertTimerRef.current) clearTimeout(alertTimerRef.current);
+    alertTimerRef.current = setTimeout(() => setActiveAlert(null), ALERT_FLASH_MS);
+  }, []);
+
+  useEffect(() => {
     const element = containerRef.current;
     if (!element) return undefined;
 
@@ -129,15 +158,10 @@ export default function CameraCard({
   }, [camera.id]);
 
   useEffect(() => {
-    if (snapshotsEnabled && streamState === "stream_unavailable") {
-      onStreamSettledRef.current("loading");
-    }
-  }, [snapshotsEnabled, streamState]);
-
-  useEffect(() => {
     pollStartedRef.current = false;
     setImageLoaded(false);
     setSnapshotUrl(null);
+    setActiveAlert(null);
     if (snapshotUrlRef.current) {
       URL.revokeObjectURL(snapshotUrlRef.current);
       snapshotUrlRef.current = null;
@@ -223,13 +247,14 @@ export default function CameraCard({
     let backoff = 0; // grows on Gemini 503/429, widens the cooldown
 
     // Grab a short burst from the live stream <img> and ask Gemini to detect
-    // smoking / littering, then raise evidence events. (No box overlay.)
+    // smoking / littering, then raise evidence events + flash an on-tile alert.
     const verify = async () => {
       const img = imgRef.current;
       if (!img || img.naturalWidth === 0 || verifying) return;
 
       verifying = true;
       lastVerify = Date.now();
+      setAnalyzing(true);
       try {
         const w = img.naturalWidth;
         const h = img.naturalHeight;
@@ -278,13 +303,21 @@ export default function CameraCard({
             .filter((d) => d.label === detLabel)
             .sort((a, b) => b.confidence - a.confidence)[0];
 
-        const violations = [
-          { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette" as const },
-          { det: best("Vape"), kind: VAPE_KIND, key: "vape" as const },
-          { det: best("Litter"), kind: LITTER_KIND, key: "litter" as const },
+        const violations: {
+          det: Detection | undefined;
+          kind: typeof CIGARETTE_KIND;
+          key: "cigarette" | "vape" | "litter";
+        }[] = [
+          { det: best("Cigarette"), kind: CIGARETTE_KIND, key: "cigarette" },
+          { det: best("Vape"), kind: VAPE_KIND, key: "vape" },
+          { det: best("Litter"), kind: LITTER_KIND, key: "litter" },
         ];
         for (const { det, kind, key } of violations) {
-          if (det && now - lastCaptureRef.current[key] >= CAPTURE_COOLDOWN_MS) {
+          if (!det) continue;
+          // Flash the on-tile alert on every confident hit…
+          if (running) flashAlert(kind.label, det.confidence);
+          // …but only save one evidence snapshot per type per cooldown window.
+          if (now - lastCaptureRef.current[key] >= CAPTURE_COOLDOWN_MS) {
             lastCaptureRef.current[key] = now;
             void captureEvidenceFromSource(
               liveImg,
@@ -304,6 +337,7 @@ export default function CameraCard({
         // span doesn't eat into the gap between cloud calls.
         lastVerify = Date.now();
         verifying = false;
+        setAnalyzing(false);
       }
     };
 
@@ -320,7 +354,7 @@ export default function CameraCard({
       running = false;
       if (timer) clearTimeout(timer);
     };
-  }, [showAi, camera.id, label]);
+  }, [showAi, camera.id, label, flashAlert]);
 
   const handleUnavailableClick = () => {
     if (isUnavailable && onCredentialsRequest) {
@@ -330,15 +364,19 @@ export default function CameraCard({
     onSelect?.();
   };
 
+  const alertColor = activeAlert ? VIOLATION_COLORS[activeAlert.label] : "#f0652c";
+
   return (
     <article
       ref={containerRef}
-      className={`relative aspect-video w-full overflow-hidden rounded-[10px] bg-black ${
+      className={`relative aspect-video w-full overflow-hidden rounded-[10px] bg-black transition-shadow duration-300 ${
         onSelect || onCredentialsRequest ? "cursor-pointer" : "cursor-default"
       } ${
-        selected
-          ? "border-2 border-[#f0652c] shadow-[0_0_0_3px_rgba(240,101,44,0.14)]"
-          : "border border-[#272727]"
+        activeAlert
+          ? "border-2 border-[#ef4444] shadow-[0_0_20px_rgba(239,68,68,0.4)] animate-[alert-pulse_1.2s_ease-in-out_infinite]"
+          : selected
+            ? "border-2 border-[#f0652c] shadow-[0_0_0_3px_rgba(240,101,44,0.14)]"
+            : "border border-[#272727]"
       }`}
       onClick={handleUnavailableClick}
     >
@@ -379,7 +417,64 @@ export default function CameraCard({
         </div>
       )}
 
+      {showAi && analyzing ? (
+        <div
+          className="pointer-events-none absolute inset-x-0 top-0 h-[2px] bg-gradient-to-r from-transparent via-[#f0652c] to-transparent animate-[scan-line_2s_linear_infinite]"
+          aria-hidden
+        />
+      ) : null}
+
       <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(to_top,rgba(0,0,0,0.55)_0%,rgba(0,0,0,0)_34%)]" />
+
+      {/* Top-left: LIVE badge + burned-in timestamp */}
+      <div className="pointer-events-none absolute left-2.5 top-2.5 flex items-center gap-1.5">
+        {isOnline ? (
+          <span className="flex items-center gap-1 rounded bg-[rgba(0,0,0,0.55)] px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em] text-white backdrop-blur-sm">
+            <span className="h-1.5 w-1.5 rounded-full bg-[#ef4444] animate-[live-blink_1.4s_ease-in-out_infinite]" />
+            Live
+          </span>
+        ) : null}
+        {isOnline && clock ? (
+          <span className="rounded bg-[rgba(0,0,0,0.45)] px-1.5 py-0.5 font-mono text-[9px] text-[#d4d4d4] backdrop-blur-sm">
+            {clock}
+          </span>
+        ) : null}
+      </div>
+
+      {/* Top-right: AI status */}
+      {showAi ? (
+        <div className="pointer-events-none absolute right-2.5 top-2.5">
+          <span
+            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.06em] backdrop-blur-sm ${
+              analyzing
+                ? "bg-[rgba(240,101,44,0.25)] text-[#ffb089]"
+                : "bg-[rgba(240,101,44,0.15)] text-[#f0652c]"
+            }`}
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full bg-[#f0652c] ${analyzing ? "animate-[pulse-dot_0.8s_ease-in-out_infinite]" : ""}`}
+            />
+            {analyzing ? "Analyzing" : "AI"}
+          </span>
+        </div>
+      ) : null}
+
+      {/* Center: violation alert banner */}
+      {activeAlert ? (
+        <div
+          className="pointer-events-none absolute inset-x-2.5 top-1/2 -translate-y-1/2 rounded-lg border px-2.5 py-1.5 backdrop-blur-md"
+          style={{ borderColor: `${alertColor}88`, background: `${alertColor}22` }}
+        >
+          <div
+            className="text-center text-[11px] font-bold uppercase tracking-[0.08em]"
+            style={{ color: alertColor }}
+          >
+            {activeAlert.label} — {Math.round(activeAlert.confidence * 100)}%
+          </div>
+        </div>
+      ) : null}
+
+      {/* Bottom-left: camera name + status dot */}
       <div className="absolute left-3 bottom-2.5 flex items-center gap-[7px]">
         <span
           className="w-[7px] h-[7px] rounded-full shrink-0"
@@ -391,11 +486,6 @@ export default function CameraCard({
         <span className="text-[12px] font-semibold text-white tracking-[0.02em] [text-shadow:0_1px_2px_rgba(0,0,0,0.6)]">
           {label}
         </span>
-        {showAi ? (
-          <span className="text-[9px] font-bold uppercase tracking-[0.06em] text-[#f0652c] bg-[rgba(240,101,44,0.2)] px-1.5 py-0.5 rounded">
-            AI
-          </span>
-        ) : null}
       </div>
 
       <button

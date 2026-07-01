@@ -6,7 +6,10 @@ import CameraExpandDialog from "./CameraExpandDialog";
 import type { CameraView } from "../lib/cameraTypes";
 import type { EvidenceEvent } from "@/lib/evidence";
 
-const MAX_AI_CAMERAS = 3;
+// How many visible cameras may run Gemini AI at once. Tuned for the paid key +
+// GEMINI_MAX_CONCURRENT so a full 4x4 wall can be analyzed in parallel; lower it
+// to cut cost, or set it below the wall size to prioritise the selected camera.
+const MAX_AI_CAMERAS = 16;
 const CAMERA_RENDER_CHUNK_SIZE = 8;
 const MAX_RENDERED_CAMERAS = 50;
 
@@ -20,6 +23,7 @@ export default function CameraGrid({
   cameras,
   columns = 2,
   selectedId,
+  clock,
   onSelect,
   onStreamFailed,
   onCredentialsRequest,
@@ -29,6 +33,7 @@ export default function CameraGrid({
   cameras: CameraView[];
   columns?: number;
   selectedId?: string | null;
+  clock?: string;
   onSelect?: (id: string | null) => void;
   onStreamFailed?: (cameraId: string) => void;
   onCredentialsRequest?: (cameraId: string) => void;
@@ -210,7 +215,7 @@ export default function CameraGrid({
         </div>
       ) : null}
       <div
-        className="grid gap-3.5"
+        className="grid gap-2.5"
         style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
       >
         {renderCameras.map((camera, index) => (
@@ -219,6 +224,7 @@ export default function CameraGrid({
             camera={camera}
             label={cameraLabel(camera, index)}
             selected={expandedCameraId === camera.id}
+            clock={clock}
             onSelect={onSelect ? () => handleExpandCamera(camera.id) : undefined}
             streamState={streamStates[camera.id] ?? "not_started"}
             onStreamSettled={(state) => {
