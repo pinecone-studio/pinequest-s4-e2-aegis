@@ -1,4 +1,8 @@
 import type { EvidenceEvent } from "./evidence";
+import {
+  mapToEvidenceEvent,
+  type EvidencePostResponse,
+} from "./evidenceEventMapping";
 import type { FrameSource } from "./frameSource";
 import { getSourceSize } from "./frameSource";
 
@@ -38,30 +42,49 @@ export async function captureEvidenceFromSource(
   thumbCanvas.getContext("2d")?.drawImage(source, 0, 0, thumbCanvas.width, thumbCanvas.height);
   const thumb = thumbCanvas.toDataURL("image/jpeg", 0.6);
 
-  const time = Date.now();
-  let savedPath: string | null = null;
+  const occurredAt = Date.now();
+  let response: EvidencePostResponse | null = null;
   let saveError: string | undefined;
 
-  const blob: Blob | null = await new Promise((resolve) =>
-    canvas.toBlob(resolve, "image/jpeg", 0.9),
-  );
+  const image: string | null = await new Promise((resolve) => {
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          resolve(null);
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : null);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(blob);
+      },
+      "image/jpeg",
+      0.9,
+    );
+  });
 
-  if (blob) {
-    const form = new FormData();
-    form.append("file", blob, "snapshot.jpg");
-    form.append("cameraId", cameraId);
-    form.append("type", kind.type);
-    form.append("confidence", String(confidence));
+  if (image) {
     try {
-      const res = await fetch("/api/evidence", { method: "POST", body: form });
+      const res = await fetch("/api/evidence", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cameraId,
+          label: kind.label,
+          confidence,
+          occurredAt,
+          summary: note ?? null,
+          image,
+        }),
+      });
       const contentType = res.headers.get("content-type") ?? "";
       const data = contentType.includes("application/json")
         ? await res.json()
         : { error: `HTTP ${res.status}` };
       if (res.ok) {
-        savedPath = data.saved as string;
+        response = data as EvidencePostResponse;
       } else {
-        saveError = data.error ?? `HTTP ${res.status}`;
+        saveError = (data as { error?: string }).error ?? `HTTP ${res.status}`;
       }
     } catch (err) {
       saveError = err instanceof Error ? err.message : "network error";
@@ -70,17 +93,19 @@ export async function captureEvidenceFromSource(
     saveError = "could not encode frame";
   }
 
-  onEvent?.({
-    id: `${time}-${cameraId}-${kind.type}`,
-    source: sourceLabel,
-    label: kind.label,
-    confidence,
-    time,
-    thumb,
-    savedPath,
-    saveError,
-    note,
-  });
+  onEvent?.(
+    mapToEvidenceEvent({
+      cameraId,
+      sourceLabel,
+      label: kind.label,
+      confidence,
+      occurredAt,
+      thumb,
+      note,
+      response,
+      saveError,
+    }),
+  );
 }
 
 export const CIGARETTE_KIND: ViolationKind = { label: "Cigarette", type: "smoking" };
