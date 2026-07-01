@@ -31,7 +31,10 @@ const VIOLATION_COLORS: Record<ViolationLabel, string> = {
 };
 
 // --- Cloud vision detection (Gemini) --------------------------------------
-const DETECT_ENDPOINT = "/api/gemini";
+// Per-camera route accepts POST; the bare /api/gemini is GET-only (health).
+function detectEndpoint(cameraId: string): string {
+  return `/api/gemini/${encodeURIComponent(cameraId)}`;
+}
 const VERIFY_COOLDOWN_MS = 4000; // min gap between Gemini calls per camera
 const VIOLATION_THRESHOLD = 0.7; // ignore low-confidence guesses
 const POLL_INTERVAL_MS = 500; // how often the loop checks the cooldown
@@ -282,7 +285,7 @@ export default function CameraCard({
         }
         if (!running || images.length === 0) return;
 
-        const res = await fetch(DETECT_ENDPOINT, {
+        const res = await fetch(detectEndpoint(camera.id), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ images }),
