@@ -1,5 +1,5 @@
 import type { CameraView } from "./cameraTypes";
-import { buildStreamProxyUrl, parseRtspUrl } from "./rtspUtils";
+import { buildStreamProxyUrl, buildSubstreamProxyUrl, parseRtspUrl } from "./rtspUtils";
 
 export type DiscoveryStatus = "running" | "completed" | "failed" | "timeout";
 
@@ -137,4 +137,16 @@ export function buildCameraStreamUrl(camera: CameraView): string {
   return camera.stream_url ?? `/api/stream/${camera.id}`;
 }
 
-export { buildRtspUrl, buildStreamProxyUrl, parsePasswordList } from "./rtspUtils";
+export function buildCameraSubstreamUrl(camera: CameraView): string {
+  if (!camera.stream_url) {
+    return `/api/stream/${camera.id}`;
+  }
+  return buildSubstreamProxyUrl(camera.stream_url);
+}
+
+export {
+  buildRtspUrl,
+  buildStreamProxyUrl,
+  buildSubstreamProxyUrl,
+  parsePasswordList,
+} from "./rtspUtils";
